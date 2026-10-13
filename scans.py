@@ -7,6 +7,7 @@ import difflib
 import os
 import re
 
+import ocr_rapid
 import ocr_windows
 import sources
 
@@ -101,18 +102,31 @@ def fix_rows(rows):
     return [[fix_numeric_cell(c) for c in row] for row in rows]
 
 
-def recognize_image(img, lang="uk"):
-    """Слова зображення з виправленням нахилу: якщо OCR бачить кут тексту, зображення вирівнюється й
-    розпізнається вдруге. Повертає (слова, інфо)."""
+def resolve_engine(engine="auto"):
+    """'auto': рушій для української (RapidOCR), якщо встановлений, інакше вбудований Windows OCR."""
+    if engine == "auto":
+        return "rapid" if ocr_rapid.is_installed() else "windows"
+    return engine
+
+
+def recognize_image(img, lang="uk", engine="auto"):
+    """Слова зображення з виправленням нахилу. Повертає (слова, інфо); інфо['engine'] - 'rapid' або 'windows'.
+    Windows OCR: якщо бачить кут тексту, зображення вирівнюється й розпізнається вдруге; RapidOCR вирівнює сам."""
     from PIL import Image
 
+    if resolve_engine(engine) == "rapid":
+        words, info = ocr_rapid.recognize(img)
+        info["engine_kind"] = "rapid"
+        return words, info
     words, info = ocr_windows.recognize(img, lang)
+    info["engine_kind"] = "windows"
     angle = info.get("angle")
     if angle is not None and MIN_DESKEW <= abs(angle) <= MAX_DESKEW:
         straight = img.rotate(angle, expand=True, fillcolor="white", resample=Image.BICUBIC)
         words2, info2 = ocr_windows.recognize(straight, lang)
         if len(words2) >= len(words):
             words, info = words2, info2
+    info["engine_kind"] = "windows"
     return fix_words(words), info
 
 
@@ -218,21 +232,21 @@ def tables_from_image_words(words, name):
 
 def notes_for(info):
     notes = ["Текст розпізнано автоматично (OCR): обов'язково перевірте вкладку «Контроль» і прев'ю."]
-    if info.get("lang") and info["lang"] != "uk":
+    if info.get("engine_kind") == "windows":
         notes.append(
-            f"Мова розпізнавання: {info['lang']} (українського пакета OCR у Windows немає, "
-            "тому «і/ї» можуть плутатися)."
+            "Використано вбудований Windows OCR, який погано читає українські «і/ї/є»: для кращої якості "
+            "встановіть рушій для української (кнопка в рядку OCR)."
         )
     return notes
 
 
-def ocr_image(path, lang="uk"):
+def ocr_image(path, lang="uk", engine="auto"):
     """(таблиці, рядки_тексту, примітки) для файлу-зображення."""
     from PIL import Image, ImageOps
 
     with Image.open(path) as img:
         img = ImageOps.exif_transpose(img).convert("RGB")
-        words, info = recognize_image(img, lang)
+        words, info = recognize_image(img, lang, engine)
     tables = tables_from_image_words(words, "Фото/скан")
     return tables, lines_from_words(words), notes_for(info)
 
@@ -246,19 +260,24 @@ def has_text_layer(path):
         return sum(len(p.chars) for p in pages) >= 20
 
 
-def ocr_pdf(path, lang="uk", progress=None):
+def ocr_pdf(path, lang="uk", progress=None, engine="auto"):
     """(таблиці, рядки_тексту, примітки) для PDF-скану: кожна сторінка відтворюється як зображення."""
     import pdfplumber
 
     tables, lines, info = [], [], {}
     with pdfplumber.open(path) as pdf:
         total = len(pdf.pages)
+        images = []
         for number, page in enumerate(pdf.pages, 1):
             if progress:
                 progress(number, total)
-            img = page.to_image(resolution=DPI).original.convert("RGB")
-            words, info = recognize_image(img, lang)
-            tables += tables_from_image_words(words, f"Стор. {number}")
-            if number <= 2:
-                lines += lines_from_words(words)
+            images.append(page.to_image(resolution=DPI).original.convert("RGB"))
+    if resolve_engine(engine) == "rapid":
+        recognized = [(w, dict(i, engine_kind="rapid")) for w, i in ocr_rapid.recognize_many(images)]
+    else:
+        recognized = [recognize_image(img, lang, engine) for img in images]
+    for number, (words, info) in enumerate(recognized, 1):
+        tables += tables_from_image_words(words, f"Стор. {number}")
+        if number <= 2:
+            lines += lines_from_words(words)
     return tables, lines, notes_for(info)

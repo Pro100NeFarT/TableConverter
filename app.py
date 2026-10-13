@@ -18,6 +18,8 @@ import checks
 import converter
 import docinfo
 import hints
+import ocr_rapid
+import ocr_windows
 import profiles
 import scans
 import sources
@@ -26,11 +28,18 @@ import updater
 NO_PROFILE_TITLE = "Без профілю (колонки як у файлі)"
 
 
+def resource_path(relative):
+    """Шлях до ресурсу: поруч із кодом або всередині зібраного exe (PyInstaller)."""
+    return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), relative)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Конвертер таблиць (Excel / PDF -> CSV)")
         self.minsize(720, 720)
+        self._logo_images = []
+        self._set_icon()
 
         self.tables = []
         self.file_path = None
@@ -46,10 +55,23 @@ class App(tk.Tk):
         self._pending_update = None
         self._update_busy = False
         self._ocr_source = False
+        self._ocr_busy = False
 
         self._build_ui()
-        self._fit_to_screen(860, 900)
+        self._fit_to_screen(860, 960)
         self.after(1500, self._check_updates)
+        self.after(600, self._refresh_ocr_status)
+
+    def _set_icon(self):
+        try:
+            from PIL import Image, ImageTk
+
+            logo = Image.open(resource_path(os.path.join("assets", "logo.png"))).convert("RGBA")
+            self._logo_images = [ImageTk.PhotoImage(logo.resize((s, s), Image.LANCZOS)) for s in (64, 32)]
+            self.iconphoto(True, *self._logo_images)
+            self._header_logo = ImageTk.PhotoImage(logo.resize((46, 46), Image.LANCZOS))
+        except Exception:
+            self._header_logo = None
 
     def _fit_to_screen(self, want_w, want_h):
         """Відкриває вікно бажаного розміру, але не більшого за екран, по центру."""
@@ -65,9 +87,31 @@ class App(tk.Tk):
     def _build_ui(self):
         pad = {"padx": 10, "pady": 6}
 
+        # --- Заголовок: логотип і для чого застосунок ---
+        header = ttk.Frame(self)
+        header.pack(fill="x", padx=12, pady=(8, 0))
+        if self._header_logo is not None:
+            tk.Label(header, image=self._header_logo).pack(side="left")
+        titles = ttk.Frame(header)
+        titles.pack(side="left", padx=10)
+        tk.Label(titles, text="Конвертер таблиць", font=("Segoe UI", 13, "bold"), anchor="w").pack(anchor="w")
+        tk.Label(
+            titles,
+            text="Рахунки, накладні й акти (Excel, PDF, скани, фото)  →  CSV або Excel для імпорту в 1С",
+            fg="gray35",
+            anchor="w",
+        ).pack(anchor="w")
+
         # --- Крок 1: файл ---
         frame1 = ttk.LabelFrame(self, text="1. Файл (Excel, PDF, скан або фото)")
         frame1.pack(fill="x", **pad)
+
+        ocr_row = ttk.Frame(frame1)
+        ocr_row.pack(side="bottom", fill="x", padx=8, pady=(0, 6))
+        ttk.Label(ocr_row, text="Розпізнавання сканів і фото (OCR):").pack(side="left")
+        self.ocr_label = tk.Label(ocr_row, text="перевірка...", fg="gray40", font=("Segoe UI", 9, "bold"))
+        self.ocr_label.pack(side="left", padx=8)
+        self.ocr_btn = ttk.Button(ocr_row, text=f"Встановити (≈{ocr_rapid.PACK_SIZE_MB} МБ)", command=self._install_ocr)
 
         self.file_label = ttk.Label(frame1, text="Файл не обрано", anchor="w")
         self.file_label.pack(side="left", fill="x", expand=True, padx=8, pady=8)
@@ -222,6 +266,101 @@ class App(tk.Tk):
         repo_label = tk.Label(bottom, text="GitHub", cursor="hand2", fg="#0b5cad", font=("Segoe UI", 9, "underline"))
         repo_label.pack(side="right", padx=(0, 12))
         repo_label.bind("<Button-1>", lambda e: webbrowser.open(updater.REPO_URL))
+
+    # ------------------------------------------------------------------ рушій розпізнавання (OCR)
+
+    def _refresh_ocr_status(self):
+        if self._ocr_busy:
+            return
+        if ocr_rapid.is_installed():
+            self.set_ocr_status(True, None)
+            return
+        q = queue.Queue()
+
+        def work():
+            try:
+                q.put(("ok", ocr_windows.available_languages()))
+            except Exception as exc:
+                q.put(("err", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(200, self._poll_ocr_status, q)
+
+    def _poll_ocr_status(self, q):
+        try:
+            windows = q.get_nowait()
+        except queue.Empty:
+            self.after(200, self._poll_ocr_status, q)
+            return
+        self.set_ocr_status(False, windows)
+
+    def set_ocr_status(self, rapid_installed, windows):
+        """Індикатор: зелений - рушій для української встановлено; помаранчевий - немає, працює Windows OCR
+        (є кнопка 'Встановити'); червоний - немає жодного рушія. windows: ('ok', мови) | ('err', текст) | None."""
+        green, orange, red = "#2e7d32", "#b26a00", "#c62828"
+        if rapid_installed:
+            version = ocr_rapid.installed_version()
+            text, color, show_button = f"рушій для української встановлено ✓ {('v' + version) if version else ''}".strip(), green, False
+        elif windows and windows[0] == "ok" and windows[1]:
+            text = "рушій для української не встановлено: працює Windows OCR, українські «і/ї/є» читає погано"
+            color, show_button = orange, True
+        else:
+            text, color, show_button = "розпізнавання недоступне: встановіть рушій для української", red, True
+        self.ocr_label.configure(text=text, fg=color)
+        if show_button:
+            self.ocr_btn.pack(side="left")
+        else:
+            self.ocr_btn.pack_forget()
+
+    def _install_ocr(self):
+        if self._ocr_busy:
+            return
+        if not messagebox.askyesno(
+            "Рушій розпізнавання",
+            f"Буде завантажено рушій розпізнавання для української (≈{ocr_rapid.PACK_SIZE_MB} МБ, з GitHub). "
+            "Права адміністратора не потрібні. Продовжити?",
+        ):
+            return
+        self._ocr_busy = True
+        self.ocr_btn.configure(state="disabled")
+        self.ocr_label.configure(text="завантаження... 0%", fg="#b26a00")
+        q = queue.Queue()
+
+        def work():
+            try:
+                ocr_rapid.install(progress=lambda done, total: q.put(("p", done, total)))
+                q.put(("done", None))
+            except Exception as exc:
+                q.put(("err", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(300, self._poll_ocr_install, q)
+
+    def _poll_ocr_install(self, q):
+        finished = None
+        try:
+            while True:
+                msg = q.get_nowait()
+                if msg[0] == "p":
+                    percent = f"{100 * msg[1] // msg[2]}%" if msg[2] else f"{msg[1] // (1024 * 1024)} МБ"
+                    self.ocr_label.configure(text=f"завантаження... {percent}", fg="#b26a00")
+                else:
+                    finished = msg
+        except queue.Empty:
+            pass
+        if finished is None:
+            self.after(300, self._poll_ocr_install, q)
+            return
+        self.finish_ocr_install(finished[0] == "done", finished[1])
+
+    def finish_ocr_install(self, ok, error):
+        self._ocr_busy = False
+        self.ocr_btn.configure(state="normal")
+        if ok:
+            messagebox.showinfo("Рушій розпізнавання", "Рушій для української встановлено й використовується автоматично.")
+        else:
+            messagebox.showwarning("Рушій розпізнавання", f"Не вдалося встановити рушій: {error}")
+        self._refresh_ocr_status()
 
     # ------------------------------------------------------------------ оновлення з GitHub
 

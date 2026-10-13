@@ -6,6 +6,8 @@ import time
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+os.environ["TC_OCR_DIR"] = os.path.join(tempfile.mkdtemp(), "none")  # без рушія для української: перевіряється Windows OCR
+
 import checks
 import converter
 import profiles

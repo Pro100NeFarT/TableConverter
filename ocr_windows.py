@@ -1,6 +1,6 @@
 """
 Розпізнавання тексту на зображеннях вбудованим в Windows 10/11 движком (Windows.Media.Ocr) через PowerShell:
-нічого встановлювати не треба, працює офлайн. Мови - ті, що встановлені в системі (зараз en-US, ru).
+нічого встановлювати не треба, працює офлайн. Мови - ті, що встановлені в системі; українські і/ї/є/ґ рушій не читає (див. ocr_rapid).
 Повертає слова з координатами у форматі, який розуміє sources.tables_from_words.
 """
 import json
@@ -33,8 +33,9 @@ function Await($op, $type) {
 }
 $available = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages | ForEach-Object { $_.LanguageTag }
 $engine = $null
-foreach ($tag in @($Lang, 'ru', 'uk', 'en-US')) {
-    if ($tag -and ($available -contains $tag)) {
+foreach ($want in @($Lang, 'ru', 'uk', 'en-US')) {
+    $tag = $available | Where-Object { $want -and $_ -like ($want + '*') } | Select-Object -First 1
+    if ($tag) {
         $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new($tag))
         if ($engine) { $used = $tag; break }
     }
@@ -59,8 +60,28 @@ $out = [pscustomobject]@{ lang = $used; available = @($available); angle = $resu
 '''
 
 
+LIST_SCRIPT = r'''
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+[Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages | ForEach-Object { $_.LanguageTag }
+'''
+
 def _powershell():
     return os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+
+
+def available_languages(timeout=30):
+    """Теги мов розпізнавання, встановлених у Windows (напр. ['en-US', 'ru']). Права адміністратора не потрібні."""
+    proc = subprocess.run(
+        [_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", LIST_SCRIPT],
+        capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode("utf-8", errors="replace").strip() or "Windows OCR недоступний")
+    return [line.strip() for line in proc.stdout.decode("utf-8", errors="replace").splitlines() if line.strip()]
+
+
+def has_language(tags, prefix="uk"):
+    return any(t.lower().startswith(prefix) for t in tags)
 
 
 def recognize(source, lang="uk", timeout=120):

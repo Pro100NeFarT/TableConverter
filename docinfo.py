@@ -131,7 +131,10 @@ def parse_header_text(text, filename=""):
     for i, m in enumerate(labels):
         key = m.lastgroup
         end = labels[i + 1].start() if i + 1 < len(labels) else len(head)
-        value = _clean(head[m.end():end])
+        raw = head[m.end():end]
+        if key in ("contract", "warehouse"):
+            raw = next((line for line in raw.split("\n") if line.strip()), "")
+        value = _clean(raw)
         if key in ("supplier", "buyer") and ":" not in m.group(0) and not _ORG_START.match(value):
             continue  # слово з тексту речення (напр. "Замовник претензій не має"), а не підпис сторони
         if value and key not in segments:

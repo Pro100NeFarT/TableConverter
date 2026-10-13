@@ -38,7 +38,7 @@ def resource_path(relative):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Конвертер таблиць (Excel / PDF -> CSV)")
+        self.title("Конвертер таблиць")
         self.minsize(720, 720)
         self._logo_images = []
         self._set_icon()
@@ -60,6 +60,7 @@ class App(tk.Tk):
         self._ocr_busy = False
 
         self._build_ui()
+        self._update_visibility()
         self._fit_to_screen(860, 960)
         self.after(1500, self._check_updates)
         self.after(600, self._refresh_ocr_status)
@@ -128,95 +129,62 @@ class App(tk.Tk):
         list_frame = ttk.Frame(frame2)
         list_frame.pack(fill="x", padx=8, pady=(8, 4))
         self.tables_list = tk.Listbox(
-            list_frame, selectmode="extended", height=5, exportselection=False
+            list_frame, selectmode="extended", height=4, exportselection=False
         )
         sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.tables_list.yview)
         self.tables_list.configure(yscrollcommand=sb.set)
         self.tables_list.pack(side="left", fill="x", expand=True)
         sb.pack(side="right", fill="y")
-        self.tables_list.bind("<<ListboxSelect>>", lambda e: self.update_preview())
+        self.tables_list.bind("<<ListboxSelect>>", lambda e: self._on_tables_selected())
 
-        pdf_frame = ttk.Frame(frame2)
-        pdf_frame.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Label(pdf_frame, text="PDF, пошук таблиць:").pack(side="left")
+        # пошук таблиць у PDF показується лише для PDF із текстом
+        self.pdf_frame = ttk.Frame(frame2)
+        ttk.Label(self.pdf_frame, text="PDF, пошук таблиць:").pack(side="left")
         self.mode_var = tk.StringVar(value=sources.PDF_MODES["auto"])
         self.mode_combo = ttk.Combobox(
-            pdf_frame,
+            self.pdf_frame,
             textvariable=self.mode_var,
             values=list(sources.PDF_MODES.values()),
             state="readonly",
-            width=42,
+            width=36,
         )
         self.mode_combo.pack(side="left", padx=6)
         self.merge_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            pdf_frame, text="Склеювати таблицю, що триває на наступній сторінці", variable=self.merge_var
+            self.pdf_frame, text="Склеювати таблицю зі сторінок", variable=self.merge_var
         ).pack(side="left", padx=6)
-        self.reload_btn = ttk.Button(pdf_frame, text="Знайти заново", command=self.reload_pdf)
+        self.reload_btn = ttk.Button(self.pdf_frame, text="Знайти заново", command=self.reload_pdf)
         self.reload_btn.pack(side="right")
-        self.info_btn = ttk.Button(pdf_frame, text="Помічник...", command=self._show_info, state="disabled")
-        self.info_btn.pack(side="right", padx=6)
 
-        ttk.Button(frame2, text="Аналізувати", command=self.analyze).pack(
-            anchor="e", padx=8, pady=(0, 8)
-        )
+        self.tools_row = ttk.Frame(frame2)
+        self.tools_row.pack(fill="x", padx=8, pady=(0, 8))
+        self.info_btn = ttk.Button(self.tools_row, text="Помічник (реквізити, контроль)...", command=self._show_info, state="disabled")
+        self.info_btn.pack(side="right")
 
-        # --- Крок 3: роздільник ---
-        frame3 = ttk.LabelFrame(self, text="3. Роздільник CSV")
+        # --- Крок 3: формат і його параметри ---
+        frame3 = ttk.LabelFrame(self, text="3. Формат результату")
         frame3.pack(fill="both", expand=True, **pad)
 
-        cols = ("char", "name", "status")
-        self.tree = ttk.Treeview(frame3, columns=cols, show="headings", height=5, selectmode="browse")
-        self.tree.heading("char", text="Символ")
-        self.tree.heading("name", text="Назва")
-        self.tree.heading("status", text="Стан у даних")
-        self.tree.column("char", width=70, anchor="center")
-        self.tree.column("name", width=260, anchor="w")
-        self.tree.column("status", width=220, anchor="w")
-        self.tree.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        self.tree.bind("<<TreeviewSelect>>", self.on_select_delimiter)
-
-        custom_frame = ttk.Frame(frame3)
-        custom_frame.pack(fill="x", padx=8, pady=(0, 4))
-        ttk.Label(custom_frame, text="Або свій символ роздільника:").pack(side="left")
-        self.custom_delim_var = tk.StringVar()
-        custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_delim_var, width=6)
-        custom_entry.pack(side="left", padx=6)
-        custom_entry.bind("<KeyRelease>", lambda e: self.update_preview())
-
-        ttk.Label(frame3, text="Прев'ю (перші рядки першої обраної таблиці):").pack(anchor="w", padx=8)
-        self.preview_text = tk.Text(frame3, height=5, wrap="none")
-        self.preview_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-        # --- Крок 4: конвертація ---
-        frame4 = ttk.LabelFrame(self, text="4. Конвертація")
-        frame4.pack(fill="x", **pad)
-
-        fmt_frame = ttk.Frame(frame4)
+        fmt_frame = ttk.Frame(frame3)
         fmt_frame.pack(fill="x", padx=8, pady=(8, 0))
         ttk.Label(fmt_frame, text="Зберегти як:").pack(side="left")
         self.format_var = tk.StringVar(value="csv")
-        ttk.Radiobutton(
-            fmt_frame, text="CSV", value="csv", variable=self.format_var, command=self._on_format_change
-        ).pack(side="left", padx=8)
-        ttk.Radiobutton(
-            fmt_frame, text="Excel (.xlsx)", value="xlsx", variable=self.format_var, command=self._on_format_change
-        ).pack(side="left", padx=8)
-        ttk.Radiobutton(
-            fmt_frame, text="JSON (для 1С)", value="json", variable=self.format_var, command=self._on_format_change
-        ).pack(side="left", padx=8)
-        self.only_table_var = tk.BooleanVar(value=False)
-        self.only_table_cb = ttk.Checkbutton(
-            fmt_frame,
-            text="Excel із PDF: лише таблиця (інакше 1 в 1, як у PDF)",
-            variable=self.only_table_var,
-            state="disabled",
-        )
-        self.only_table_cb.pack(side="left", padx=16)
+        for text, value in (("CSV", "csv"), ("Excel (.xlsx)", "xlsx"), ("JSON (для 1С)", "json")):
+            ttk.Radiobutton(
+                fmt_frame, text=text, value=value, variable=self.format_var, command=self._on_format_change
+            ).pack(side="left", padx=8)
+        self.format_hint = ttk.Label(fmt_frame, text="", foreground="gray35")
+        self.format_hint.pack(side="left", padx=12)
 
-        profile_frame = ttk.Frame(frame4)
-        profile_frame.pack(fill="x", padx=8, pady=(6, 0))
-        ttk.Label(profile_frame, text="Профіль для 1С (CSV):").pack(side="left")
+        # параметри формату: показується лише блок вибраного формату
+        self.options_holder = ttk.Frame(frame3)
+        self.options_holder.pack(fill="x", padx=8, pady=(6, 0))
+
+        # -- CSV: профіль, роздільник, очищення
+        self.csv_frame = ttk.Frame(self.options_holder)
+        profile_frame = ttk.Frame(self.csv_frame)
+        profile_frame.pack(fill="x")
+        ttk.Label(profile_frame, text="Профіль для 1С:").pack(side="left")
         self.profile_var = tk.StringVar(value=NO_PROFILE_TITLE)
         self.profile_combo = ttk.Combobox(
             profile_frame,
@@ -230,8 +198,30 @@ class App(tk.Tk):
         self.columns_btn = ttk.Button(profile_frame, text="Колонки...", command=self._open_columns)
         self.columns_btn.pack(side="left")
 
-        checks_frame = ttk.Frame(frame4)
-        checks_frame.pack(side="left", padx=8, pady=8)
+        delim_box = ttk.LabelFrame(self.csv_frame, text="Роздільник")
+        delim_box.pack(fill="x", pady=(6, 0))
+        cols = ("char", "name", "status")
+        self.tree = ttk.Treeview(delim_box, columns=cols, show="headings", height=4, selectmode="browse")
+        self.tree.heading("char", text="Символ")
+        self.tree.heading("name", text="Назва")
+        self.tree.heading("status", text="Стан у даних")
+        self.tree.column("char", width=70, anchor="center")
+        self.tree.column("name", width=260, anchor="w")
+        self.tree.column("status", width=220, anchor="w")
+        self.tree.pack(fill="x", padx=8, pady=(6, 4))
+        self.tree.bind("<<TreeviewSelect>>", self.on_select_delimiter)
+
+        custom_frame = ttk.Frame(delim_box)
+        custom_frame.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(custom_frame, text="Обраний роздільник (можна ввести свій символ):").pack(side="left")
+        self.custom_delim_var = tk.StringVar()
+        custom_entry = ttk.Entry(custom_frame, textvariable=self.custom_delim_var, width=6)
+        custom_entry.pack(side="left", padx=6)
+        custom_entry.bind("<KeyRelease>", lambda e: self.update_preview())
+        ttk.Button(custom_frame, text="Підібрати заново", command=self.analyze).pack(side="right")
+
+        checks_frame = ttk.Frame(self.csv_frame)
+        checks_frame.pack(fill="x", pady=(6, 0))
 
         def check(text, var, row, col, preview=True):
             cb = ttk.Checkbutton(
@@ -253,9 +243,38 @@ class App(tk.Tk):
         self.numbers_var = tk.BooleanVar(value=True)
         self.numbers_cb = check("Нормалізувати числа (3 600,00 -> 3600.00)", self.numbers_var, 2, 1)
 
-        ttk.Button(frame4, text="Зберегти...", command=self.convert).pack(
-            side="right", padx=8, pady=8
+        # -- Excel: без очищення; для PDF - 1 в 1 або лише таблиця
+        self.xlsx_frame = ttk.Frame(self.options_holder)
+        self.only_table_var = tk.BooleanVar(value=False)
+        self.only_table_cb = ttk.Checkbutton(
+            self.xlsx_frame,
+            text="Лише таблиця (інакше 1 в 1, як у PDF)",
+            variable=self.only_table_var,
+            state="disabled",
         )
+        self.xlsx_note = ttk.Label(self.xlsx_frame, text="Дані зберігаються як у джерелі, без очищення.", foreground="gray35")
+        self.xlsx_note.pack(anchor="w")
+
+        # -- JSON: колонки за профілем УпрИмпортИзExcel
+        self.json_frame = ttk.Frame(self.options_holder)
+        ttk.Label(
+            self.json_frame,
+            text="Шапка документа й товари в одному файлі для обробки УпрИмпортИзExcel.\n"
+            "Колонки підбираються автоматично; перевірити чи виправити - кнопка «Колонки...».",
+            foreground="gray35",
+            justify="left",
+        ).pack(side="left")
+        ttk.Button(self.json_frame, text="Колонки...", command=self._open_columns).pack(side="right")
+
+        # --- Прев'ю й збереження ---
+        self.preview_frame = ttk.LabelFrame(frame3, text="Прев'ю")
+        self.preview_frame.pack(fill="both", expand=True, padx=8, pady=(8, 8))
+        self.preview_text = tk.Text(self.preview_frame, height=5, wrap="none")
+        self.preview_text.pack(fill="both", expand=True, padx=8, pady=8)
+
+        save_row = ttk.Frame(self)
+        save_row.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(save_row, text="Зберегти...", command=self.convert).pack(side="right")
 
         bottom = ttk.Frame(self)
         bottom.pack(fill="x", padx=10, pady=(0, 6))
@@ -483,6 +502,7 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.preview_text.delete("1.0", "end")
         self.candidates_report = []
+        self.custom_delim_var.set("")
         self._set_info([], show=False)
 
     def _pdf_controls_state(self, enabled):
@@ -490,15 +510,52 @@ class App(tk.Tk):
         self.mode_combo.configure(state=state)
         self.reload_btn.configure(state="normal" if enabled else "disabled")
 
+    def _is_text_pdf(self):
+        return bool(self.file_path) and sources.is_pdf(self.file_path) and not self._ocr_source
+
+    def _update_visibility(self):
+        """Показує лише потрібне: пошук таблиць - для PDF; параметри - лише вибраного формату."""
+        fmt = self.format_var.get()
+        if self._is_text_pdf():
+            self.pdf_frame.pack(fill="x", padx=8, pady=(0, 4), before=self.tools_row)
+        else:
+            self.pdf_frame.pack_forget()
+        for frame in (self.csv_frame, self.xlsx_frame, self.json_frame):
+            frame.pack_forget()
+        {"csv": self.csv_frame, "xlsx": self.xlsx_frame, "json": self.json_frame}[fmt].pack(fill="x")
+        if fmt == "xlsx" and self._is_text_pdf():
+            self.only_table_cb.pack(anchor="w", before=self.xlsx_note)
+            self.xlsx_note.configure(text="Для PDF без позначки Excel містить усю сторінку 1 в 1.")
+        else:
+            self.only_table_cb.pack_forget()
+            self.xlsx_note.configure(text="Дані зберігаються як у джерелі, без очищення.")
+        self.format_hint.configure(text={
+            "csv": "очищення й роздільник під обробку 1С",
+            "xlsx": "без очищення",
+            "json": "шапка + товари для УпрИмпортИзExcel",
+        }[fmt])
+        self.preview_frame.configure(text={
+            "csv": "Прев'ю CSV (перші рядки першої обраної таблиці)",
+            "xlsx": "Прев'ю даних (перші рядки першої обраної таблиці)",
+            "json": "Прев'ю JSON: перші позиції товарів першої обраної таблиці",
+        }[fmt])
+
     def _on_format_change(self):
         is_csv = self.format_var.get() == "csv"
         for cb in (
             self.bom_cb, self.flatten_cb, self.quotes_cb, self.trim_cb, self.fill_merges_cb, self.numbers_cb
         ):
             cb.configure(state="normal" if is_csv else "disabled")
-        is_pdf = bool(self.file_path) and sources.is_pdf(self.file_path) and not self._ocr_source
         is_xlsx = self.format_var.get() == "xlsx"
-        self.only_table_cb.configure(state="normal" if (is_xlsx and is_pdf) else "disabled")
+        self.only_table_cb.configure(state="normal" if (is_xlsx and self._is_text_pdf()) else "disabled")
+        self._update_visibility()
+        if is_csv and self.tables and not self.candidates_report:
+            self.analyze(silent=True)
+        self.update_preview()
+
+    def _on_tables_selected(self):
+        if self.format_var.get() == "csv":
+            self.analyze(silent=True)
         self.update_preview()
 
     def reload(self):
@@ -533,7 +590,7 @@ class App(tk.Tk):
                 )
             else:
                 self._set_info([], show=False)
-                self.status_var.set("Файл завантажено. Оберіть аркуші та натисніть 'Аналізувати'.")
+                self.status_var.set("Файл завантажено. Оберіть аркуші й формат збереження.")
 
     def reload_pdf(self):
         if self.file_path and sources.is_pdf(self.file_path):
@@ -599,7 +656,7 @@ class App(tk.Tk):
                     self._set_info(msg[2], show=True)
                     if msg[1]:
                         self.status_var.set(
-                            f"Знайдено таблиць: {len(msg[1])}. Оберіть потрібні та натисніть 'Аналізувати'. "
+                            f"Знайдено таблиць: {len(msg[1])}. Оберіть потрібні й формат збереження. "
                             + " ".join(msg[4])
                         )
                     else:
@@ -739,6 +796,7 @@ class App(tk.Tk):
                 item = self.tree.get_children()[i]
                 self.tree.selection_set(item)
                 self.tree.see(item)
+                self.on_select_delimiter()
                 return
 
     def _on_profile_change(self):
@@ -800,19 +858,23 @@ class App(tk.Tk):
                 self.tables_list.selection_set(i)
         self.user_mapping = {}
         self._sync_assistant_button()
+        if self.format_var.get() == "csv":
+            self.analyze(silent=True)
 
     def selected_tables(self):
         return [self.tables[i] for i in self.tables_list.curselection()]
 
     # ------------------------------------------------------------------ аналіз
 
-    def analyze(self):
+    def analyze(self, silent=False):
         if not self.tables:
-            messagebox.showwarning("Увага", "Спершу оберіть файл із таблицями.")
+            if not silent:
+                messagebox.showwarning("Увага", "Спершу оберіть файл із таблицями.")
             return
         tables = self.selected_tables()
         if not tables:
-            messagebox.showwarning("Увага", "Оберіть хоча б одну таблицю.")
+            if not silent:
+                messagebox.showwarning("Увага", "Оберіть хоча б одну таблицю.")
             return
 
         counter, total_cells, with_nl, with_quote = converter.analyze_characters(tables)
@@ -839,12 +901,16 @@ class App(tk.Tk):
         total_trailing = sum(self._trailing_empty.values())
         if total_trailing:
             status += f". Порожніх рядків у кінці: {total_trailing} (будуть відкинуті)"
-        self.status_var.set(status)
+        if not silent:
+            self.status_var.set(status)
 
         if first_safe_item:
             self.tree.selection_set(first_safe_item)
             self.tree.see(first_safe_item)
             self._select_profile_delimiter()
+            self.on_select_delimiter()
+        elif silent:
+            self.custom_delim_var.set("")
         else:
             messagebox.showwarning(
                 "Увага",
@@ -855,22 +921,27 @@ class App(tk.Tk):
     def get_selected_delimiter(self):
         custom = self.custom_delim_var.get()
         if custom:
-            return custom[0]
+            return "\t" if custom.strip().lower() == "tab" else custom[0]
         sel = self.tree.selection()
-        if not sel:
+        if not sel or self.tree.index(sel[0]) >= len(self.candidates_report):
             return None
         return self.candidates_report[self.tree.index(sel[0])]["char"]
 
     def on_select_delimiter(self, event=None):
-        self.custom_delim_var.set("")
+        """Обраний у списку роздільник підставляється в поле (Tab - словом); у полі його можна змінити."""
+        sel = self.tree.selection()
+        if sel and self.tree.index(sel[0]) < len(self.candidates_report):
+            char = self.candidates_report[self.tree.index(sel[0])]["char"]
+            self.custom_delim_var.set("Tab" if char == "\t" else char)
         self.update_preview()
 
     def update_preview(self):
         tables = self.selected_tables()
         key = self._active_profile()
-        delim = self.get_selected_delimiter() or (
-            profiles.PROFILES[key]["delimiter"] if key else ("\t" if self.format_var.get() in ("xlsx", "json") else None)
-        )
+        if self.format_var.get() == "csv":
+            delim = self.get_selected_delimiter() or (profiles.PROFILES[key]["delimiter"] if key else None)
+        else:
+            delim = "\t"
         if not tables or not delim:
             return
         try:

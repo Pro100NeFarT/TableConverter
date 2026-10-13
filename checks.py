@@ -1,5 +1,5 @@
 """
-Контроль розпізнаної таблиці перед завантаженням у 1С: суми, кількість позицій, дробові кількості,
+Контроль розпізнаної таблиці перед завантаженням у 1С: суми, кількість позицій,
 нечислові значення. Рівні: ok / warn / error.
 """
 from decimal import Decimal, InvalidOperation
@@ -58,7 +58,7 @@ def run_checks(prepared, mapping, info=None):
         else:
             results.append(("error", f"Позицій {len(items)}, а в документі «Всього найменувань» {declared}."))
 
-    bad_numbers, bad_rows, fractional, zero_price, empty_names = [], [], [], [], []
+    bad_numbers, bad_rows, zero_price, empty_names = [], [], [], []
     total_sum = Decimal(0)
     have_sum = False
     for n, item in enumerate(items, 1):
@@ -72,8 +72,6 @@ def run_checks(prepared, mapping, info=None):
                 bad_numbers.append(f"{n} ({label}: «{raw}»)")
         if not str(item.get("Наименование", "")).strip():
             empty_names.append(n)
-        if qty is not None and qty != qty.to_integral_value():
-            fractional.append(n)
         if total is not None:
             total_sum += total
             have_sum = True
@@ -92,31 +90,33 @@ def run_checks(prepared, mapping, info=None):
         results.append(("warn", "Кількість × ціна ≠ сума: рядок " + _rows_list(bad_rows) + "."))
     elif have_sum and not bad_numbers:
         results.append(("ok", "У кожному рядку кількість × ціна = сума."))
-    if fractional:
-        results.append((
-            "warn",
-            "Дробова кількість у рядках " + _rows_list(fractional) + ": обробки 1С відкидають дробову частину "
-            "(ТолькоЦифры / УбратьБуквы), а ціна рахується як Сума / Кількість.",
-        ))
     if zero_price:
         results.append(("warn", "Нульова ціна: рядок " + _rows_list(zero_price) + "."))
 
     if have_sum:
         results.append(("ok", f"Сума по рядках: {_fmt(total_sum)}."))
-        declared_total = to_decimal(info.get("Разом"))
-        if declared_total is None and totals:
-            declared_total = to_decimal(totals[-1].get("Сумма"))
-        if declared_total is not None:
-            if abs(declared_total - total_sum) <= Decimal("0.01"):
-                results.append(("ok", f"Сума збігається з «Разом» документа ({_fmt(declared_total)})."))
+        declared = [
+            (label, to_decimal(info.get(key)))
+            for label, key in (("Разом", "Разом"), ("Разом з ПДВ", "Разом з ПДВ"))
+            if to_decimal(info.get(key)) is not None
+        ]
+        if not declared and totals:
+            inner = to_decimal(totals[-1].get("Сумма"))
+            if inner is not None:
+                declared = [("Разом", inner)]
+        if not declared:
+            results.append(("warn", "У документі не знайдено «Разом» - сума не звірена."))
+        else:
+            match = next((d for d in declared if abs(d[1] - total_sum) <= Decimal("0.01")), None)
+            if match:
+                results.append(("ok", f"Сума збігається з «{match[0]}» документа ({_fmt(match[1])})."))
             else:
+                label, value = declared[0]
                 results.append((
                     "error",
-                    f"Сума по рядках {_fmt(total_sum)} не збігається з «Разом» {_fmt(declared_total)} "
-                    f"(різниця {_fmt(abs(declared_total - total_sum))}) - можлива помилка розпізнавання.",
+                    f"Сума по рядках {_fmt(total_sum)} не збігається з «{label}» {_fmt(value)} "
+                    f"(різниця {_fmt(abs(value - total_sum))}) - можлива помилка розпізнавання.",
                 ))
-        else:
-            results.append(("warn", "У документі не знайдено «Разом» - сума не звірена."))
     return results
 
 

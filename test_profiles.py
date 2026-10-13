@@ -71,7 +71,7 @@ bad = checks.run_checks(PREPARED, upr, {"Разом": "22 000,00", "Кількі
 assert sum(1 for lvl, _ in bad if lvl == "error") == 2, bad
 frac = [HEADER, ["1", "Сир", "0,5", "кг", "100,00", "50,00"], ["2", "Хліб", "2", "шт", "10,00", "25,00"]]
 fr = checks.run_checks(frac, upr, {})
-assert any(lvl == "warn" and "Дробова кількість" in m for lvl, m in fr), fr
+assert not any("Дробова" in m for _, m in fr), fr  # дробова кількість (0,5) - не привід для попередження
 assert any(lvl == "warn" and "× ціна ≠ сума" in m for lvl, m in fr), fr
 broken = checks.run_checks([HEADER, ["1", "Товар", "x", "шт", "1", "1"]], upr, {})
 assert any(lvl == "error" and "Не розпізнано число" in m for lvl, m in broken), broken

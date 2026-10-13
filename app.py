@@ -19,6 +19,7 @@ import converter
 import docinfo
 import hints
 import profiles
+import scans
 import sources
 import updater
 
@@ -44,6 +45,7 @@ class App(tk.Tk):
         self._layout_cache = {}
         self._pending_update = None
         self._update_busy = False
+        self._ocr_source = False
 
         self._build_ui()
         self._fit_to_screen(860, 900)
@@ -64,7 +66,7 @@ class App(tk.Tk):
         pad = {"padx": 10, "pady": 6}
 
         # --- Крок 1: файл ---
-        frame1 = ttk.LabelFrame(self, text="1. Файл (Excel або PDF)")
+        frame1 = ttk.LabelFrame(self, text="1. Файл (Excel, PDF, скан або фото)")
         frame1.pack(fill="x", **pad)
 
         self.file_label = ttk.Label(frame1, text="Файл не обрано", anchor="w")
@@ -317,9 +319,10 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(
             title="Обрати файл",
             filetypes=[
-                ("Excel та PDF", "*.xlsx *.xlsm *.pdf"),
-                ("Excel файли", "*.xlsx *.xlsm"),
+                ("Excel, PDF та фото", "*.xlsx *.xlsm *.xls *.pdf *.jpg *.jpeg *.png *.bmp *.tif *.tiff"),
+                ("Excel файли", "*.xlsx *.xlsm *.xls"),
                 ("PDF файли", "*.pdf"),
+                ("Фото та скани", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff"),
                 ("Усі файли", "*.*"),
             ],
         )
@@ -349,7 +352,7 @@ class App(tk.Tk):
             self.bom_cb, self.flatten_cb, self.quotes_cb, self.trim_cb, self.fill_merges_cb, self.numbers_cb
         ):
             cb.configure(state="normal" if is_csv else "disabled")
-        is_pdf = bool(self.file_path) and sources.is_pdf(self.file_path)
+        is_pdf = bool(self.file_path) and sources.is_pdf(self.file_path) and not self._ocr_source
         self.only_table_cb.configure(state="normal" if (not is_csv and is_pdf) else "disabled")
         self.update_preview()
 
@@ -357,12 +360,14 @@ class App(tk.Tk):
         if not self.file_path:
             return
         is_pdf = sources.is_pdf(self.file_path)
-        # PDF (друковані форми): унікальні назви колонок і числа - так за замовчуванням; Excel - без змін даних
-        self.fill_merges_var.set(is_pdf)
-        self.numbers_var.set(is_pdf)
+        is_scan = is_pdf or scans.is_image(self.file_path)
+        self._ocr_source = scans.is_image(self.file_path)
+        # PDF/скани (друковані форми): унікальні назви колонок і числа - так за замовчуванням; Excel - без змін даних
+        self.fill_merges_var.set(is_scan)
+        self.numbers_var.set(is_scan)
         self._on_format_change()
-        if is_pdf:
-            self._pdf_controls_state(True)
+        if is_scan:
+            self._pdf_controls_state(is_pdf)
             self._load_pdf_async()
         else:
             self._pdf_controls_state(False)
@@ -372,7 +377,18 @@ class App(tk.Tk):
                 messagebox.showerror("Помилка", f"Не вдалося відкрити файл:\n{exc}")
                 return
             self._set_tables(tables)
-            self.status_var.set("Файл завантажено. Оберіть аркуші та натисніть 'Аналізувати'.")
+            form = next((t for t in tables if t.lines), None)
+            if form:  # друкована форма (рахунок, накладна): реквізити з комірок, очищення як для PDF
+                self.fill_merges_var.set(True)
+                self.numbers_var.set(True)
+                info = docinfo.parse_header_text("\n".join(form.lines), os.path.basename(self.file_path))
+                self._set_info(info, show=True)
+                self.status_var.set(
+                    "Знайдено друковану форму: таблицю взято з аркуша, реквізити - з комірок поза таблицею."
+                )
+            else:
+                self._set_info([], show=False)
+                self.status_var.set("Файл завантажено. Оберіть аркуші та натисніть 'Аналізувати'.")
 
     def reload_pdf(self):
         if self.file_path and sources.is_pdf(self.file_path):
@@ -394,16 +410,27 @@ class App(tk.Tk):
         q = queue.Queue()
         path, mode, merge = self.file_path, self._current_mode(), self.merge_var.get()
 
+        def parse_lines(lines):
+            return docinfo.parse_header_text("\n".join(lines), os.path.basename(path))
+
         def work():
             try:
-                tables = sources.load_pdf_tables(
-                    path, mode=mode, merge_continued=merge, progress=lambda i, n: q.put(("p", i, n))
-                )
-                try:
-                    info = docinfo.extract_pdf_info(path)
-                except Exception:
-                    info = []
-                q.put(("done", tables, info))
+                if scans.is_image(path):
+                    q.put(("o", 0, 1))
+                    tables, lines, notes = scans.ocr_image(path)
+                    q.put(("done", tables, parse_lines(lines), True, notes))
+                elif scans.has_text_layer(path):
+                    tables = sources.load_pdf_tables(
+                        path, mode=mode, merge_continued=merge, progress=lambda i, n: q.put(("p", i, n))
+                    )
+                    try:
+                        info = docinfo.extract_pdf_info(path)
+                    except Exception:
+                        info = []
+                    q.put(("done", tables, info, False, []))
+                else:
+                    tables, lines, notes = scans.ocr_pdf(path, progress=lambda i, n: q.put(("o", i, n)))
+                    q.put(("done", tables, parse_lines(lines), True, notes))
             except Exception as exc:
                 q.put(("err", exc))
 
@@ -417,22 +444,29 @@ class App(tk.Tk):
                 msg = q.get_nowait()
                 if msg[0] == "p":
                     self.status_var.set(f"Пошук таблиць у PDF: сторінка {msg[1]} з {msg[2]}...")
+                elif msg[0] == "o":
+                    self.status_var.set(f"Розпізнавання тексту (OCR), може тривати кілька секунд: {max(msg[1], 1)} з {msg[2]}...")
                 elif msg[0] == "done":
                     finished = True
+                    self._ocr_source = msg[3]
+                    self._on_format_change()
                     self._set_tables(msg[1])
                     self._set_info(msg[2], show=True)
                     if msg[1]:
                         self.status_var.set(
-                            f"Знайдено таблиць: {len(msg[1])}. Оберіть потрібні та натисніть 'Аналізувати'."
+                            f"Знайдено таблиць: {len(msg[1])}. Оберіть потрібні та натисніть 'Аналізувати'. "
+                            + " ".join(msg[4])
                         )
                     else:
                         self.status_var.set("Таблиць не знайдено.")
-                        messagebox.showinfo(
-                            "Таблиць не знайдено",
-                            "У PDF не знайдено таблиць. Спробуйте інший режим пошуку "
-                            "(наприклад, 'За вирівнюванням тексту') і натисніть 'Знайти заново'. "
-                            "Якщо PDF - скан чи фото, текстового шару немає і цей режим не спрацює.",
+                        hint = (
+                            "На фото чи скані таблицю не знайдено: знімайте рівно, при хорошому світлі, "
+                            "щоб увесь документ був у кадрі, і спробуйте ще раз."
+                            if msg[3]
+                            else "У PDF не знайдено таблиць. Спробуйте інший режим пошуку "
+                            "(наприклад, 'За вирівнюванням тексту') і натисніть 'Знайти заново'."
                         )
+                        messagebox.showinfo("Таблиць не знайдено", hint)
                 elif msg[0] == "err":
                     finished = True
                     self.status_var.set("Помилка читання PDF.")
@@ -592,7 +626,7 @@ class App(tk.Tk):
         if not tables:
             return ["Оберіть таблицю."]
         headers = {t.name: (self.prepare_table(t) or [[]])[0] for t in tables}
-        if sources.is_pdf(self.file_path) and not self.only_table_var.get():
+        if sources.is_pdf(self.file_path) and not self._ocr_source and not self.only_table_var.get():
             entries = [(t, headers[t.name], self.mapping_for(t)) for t in tables]
             return hints.excel_lines_layout(self._layout_sheets(), entries)
         entries = [(t.name, t.rows, headers[t.name], self.mapping_for(t)) for t in tables]
@@ -603,8 +637,9 @@ class App(tk.Tk):
         self.tables_list.delete(0, "end")
         for t in tables:
             self.tables_list.insert("end", f"{t.name}   ({t.n_rows} рядків x {t.n_cols} колонок)")
-        if tables:
-            self.tables_list.selection_set(0, "end")
+        for i, t in enumerate(tables):
+            if t.selected:
+                self.tables_list.selection_set(i)
         self.user_mapping = {}
         self._sync_assistant_button()
 
@@ -707,7 +742,7 @@ class App(tk.Tk):
         )
 
     def _save_xlsx(self, base_dir, base_name):
-        full_page = sources.is_pdf(self.file_path) and not self.only_table_var.get()
+        full_page = sources.is_pdf(self.file_path) and not self._ocr_source and not self.only_table_var.get()
         tables = self.selected_tables()
         if not full_page and not tables:
             messagebox.showwarning("Увага", "Оберіть хоча б одну таблицю.")

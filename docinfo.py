@@ -13,7 +13,7 @@ MONTHS = {
 }
 
 _LABELS = {
-    "supplier": r"Постачальник|Продавець|Поставщик|Продавец",
+    "supplier": r"Постачальник|Продавець|Виконавець|Поставщик|Продавец|Исполнитель",
     "buyer": r"Покупець|Покупатель|Замовник|Заказчик|Платник|Плательщик",
     "contract": r"Договір|Договор",
     "warehouse": r"Склад",
@@ -23,14 +23,25 @@ _LABEL_RE = re.compile(
     r"^[ \t]*(?:" + "|".join(f"(?P<{k}>{v})" for k, v in _LABELS.items()) + r")\b[ \t]*:?[ \t]*",
     re.IGNORECASE | re.MULTILINE,
 )
-_TABLE_HEADER_RE = re.compile(r"^[ \t]*№[ \t]+\S.*(?:Товар|Назва|Найменування|Наименование|Кількість|Количество)", re.IGNORECASE | re.MULTILINE)
-_TITLE_RE = re.compile(r"^(?P<type>[^\n№]*?)[ \t]*№[ \t]*(?P<num>[^\s,;]+)[ \t]+(?:від|от)[ \t]+(?P<date>[^\n]+?)[ \t]*$", re.MULTILINE)
+_TABLE_HEADER_RE = re.compile(
+    r"^[^\n]*?(?:Товар|Назва|Найменування|Наименование)[^\n]*?(?:Кількість|Количество|Кіл-сть|К-сть)[^\n]*?(?:Ціна|Цена|Сума|Сумма)[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_TITLE_RE = re.compile(r"^(?P<type>[^\n№]*?)[ \t]*№[ \t]*(?P<num>[^\s,;]+)[ \t]+(?:(?:від|от)[ \t]+)?(?P<date>\d[^\n]*?)[ \t]*$", re.MULTILINE)
 _NAME_SPLIT_RE = re.compile(
-    r",\s*(?=(?:ІПН|ІНН|ЄДРПОУ|ЕДРПОУ|код\b|р/р|р/с|IBAN|ДРФО|тел\b|UA\d{2}|\d{5}\b))", re.IGNORECASE
+    r",\s*(?=(?:ІПН|ІНН|ЄДРПОУ|ЕДРПОУ|код\b|р/р|р/с|IBAN|ДРФО|тел\b|UA\d{2}|\d{5}\b))"
+    r"|\s+(?=(?:п/р|р/р|р/с|IBAN|ЄДРПОУ|ЕДРПОУ|ІПН|ІНН|тел)\b)",
+    re.IGNORECASE,
 )
 _TAX_ID_RE = re.compile(r"(?:ІПН|ІНН)\s*:?\s*(\d{8,12})", re.IGNORECASE)
 _EDRPOU_RE = re.compile(r"(?:ЄДРПОУ|ЕДРПОУ)\s*:?\s*(\d{8,10})", re.IGNORECASE)
 _IBAN_RE = re.compile(r"\bUA\d{27}\b")
+_ORG_START = re.compile(
+    r"^(?:ТОВ|ТзОВ|ТДВ|ПП|ФОП|ПАТ|АТ|ПрАТ|ДП|КП|ФО|ООО|ИП|Фізична|Товариство|Приватне|Публічне|Акціонерне|Державне|Підприємець)\b",
+    re.IGNORECASE,
+)
+_AMOUNTS_LINE = r"((?:\d[\d   ]*[.,]\d{2}[ \t]*)+)"
+_RECIPIENT_RE = re.compile(r"^[ \t]*(?:Отримувач|Одержувач|Получатель)\b", re.IGNORECASE | re.MULTILINE)
 _AMOUNT = r"(\d[\d   ]*[.,]\d{2})"
 
 
@@ -65,6 +76,30 @@ def _split_party(text):
     return name, code, iban.group(0) if iban else None
 
 
+def _last_amount(chunk):
+    """Права сума в рядку підсумків (комірки розділені табуляцією; у друкованих формах - сума без ПДВ)."""
+    parts = [p for p in re.split(r"\t+", chunk.strip()) if p.strip()]
+    return _clean(parts[-1]) if parts else ""
+
+
+def _recipient_code(text):
+    """Код отримувача з блоку платіжного доручення: 'Код 12345678' або 'Код' з цифрами в наступних рядках."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if not _RECIPIENT_RE.match(line):
+            continue
+        window = lines[i: i + 8]
+        for j, candidate in enumerate(window):
+            m = re.match(r"^\s*Код\b[ \t]*:?[ \t]*(\d{8,10})\b", candidate, re.IGNORECASE)
+            if m:
+                return m.group(1)
+            if re.match(r"^\s*Код\b", candidate, re.IGNORECASE):
+                for nxt in window[j + 1: j + 4]:
+                    if re.fullmatch(r"\s*\d{8,10}\s*", nxt):
+                        return nxt.strip()
+    return None
+
+
 def parse_header_text(text, filename=""):
     """Повертає список (поле, значення) у зручному порядку; порожні значення не повертаються."""
     stop = _TABLE_HEADER_RE.search(text)
@@ -97,12 +132,18 @@ def parse_header_text(text, filename=""):
         key = m.lastgroup
         end = labels[i + 1].start() if i + 1 < len(labels) else len(head)
         value = _clean(head[m.end():end])
+        if key in ("supplier", "buyer") and ":" not in m.group(0) and not _ORG_START.match(value):
+            continue  # слово з тексту речення (напр. "Замовник претензій не має"), а не підпис сторони
         if value and key not in segments:
             segments[key] = value
 
     for key, title_ua in (("supplier", "Постачальник"), ("buyer", "Покупець")):
         if key in segments:
             name, code, iban = _split_party(segments[key])
+            if key == "supplier" and not code:
+                digits = _recipient_code(head)
+                if digits:
+                    code = f"ЄДРПОУ {digits}" if len(digits) == 8 else f"ІПН {digits}"
             found.append((title_ua, name))
             if code:
                 found.append((f"{title_ua}: код", code))
@@ -119,11 +160,35 @@ def parse_header_text(text, filename=""):
     )
     if count:
         found.append(("Кількість найменувань", count.group(1)))
-    total = re.search(r"^[ \t]*Разом\s*:?\s*" + _AMOUNT, text, re.IGNORECASE | re.MULTILINE)
+    flags = re.IGNORECASE | re.MULTILINE
+    total = re.search(r"^[ \t]*(?:Разом|Всього|Усього|Итого|Всего)[ \t]*:?[ \t]*" + _AMOUNTS_LINE, text, flags)
+    vat = re.search(r"^[ \t]*(?:Сума\s+ПДВ|Сумма\s+НДС)[ \t]*:?[ \t]*" + _AMOUNTS_LINE, text, flags)
+    with_vat = re.search(
+        r"^[ \t]*(?:Разом|Всього|Усього|Итого|Всего)[ \t]+(?:із|з|с)[ \t]+(?:ПДВ|НДС)[ \t]*:?[ \t]*" + _AMOUNTS_LINE,
+        text,
+        flags,
+    )
     if total:
-        found.append(("Разом", _clean(total.group(1))))
+        found.append(("Разом", _last_amount(total.group(1))))
     elif count and count.group(2):
         found.append(("Разом", _clean(count.group(2))))
+    if vat:
+        found.append(("ПДВ", _last_amount(vat.group(1))))
+    if with_vat:
+        found.append(("Разом з ПДВ", _last_amount(with_vat.group(1))))
+
+    if not any(label.endswith(": код") for label, _ in found):
+        # сторони не підписані (акт, скан): збираємо всі коди й рахунки з тексту, щоб оператор міг їх скопіювати
+        ids = []
+        for m in re.finditer(r"(?:ЄДРПОУ|ЕДРПОУ)\s*:?\s*(\d{8,10})", text, re.IGNORECASE):
+            ids.append(f"ЄДРПОУ {m.group(1)}")
+        for m in re.finditer(r"(?:ІПН|ІНН|ДРФО)\s*:?\s*(\d{10,12})", text, re.IGNORECASE):
+            ids.append(f"ІПН {m.group(1)}")
+        ibans = _IBAN_RE.findall(text)
+        if ids:
+            found.append(("Коди в тексті", "; ".join(dict.fromkeys(ids))))
+        if ibans:
+            found.append(("IBAN у тексті", "; ".join(dict.fromkeys(ibans))))
     return found
 
 

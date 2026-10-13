@@ -1,11 +1,11 @@
 """
-Джерела таблиць: Excel (.xlsx/.xlsm) та PDF з текстовим шаром.
+Джерела таблиць: Excel (.xlsx/.xlsm/.xls) та PDF з текстовим шаром.
 Кожне джерело повертає список Table(name, rows), далі працює спільний конвеєр.
 """
 import os
 from dataclasses import dataclass, field
 
-import openpyxl
+import excelforms
 
 PDF_MODES = {
     "auto": "Авто (спершу за лініями, потім за текстом)",
@@ -21,6 +21,8 @@ class Table:
     merges: list = field(default_factory=list)  # (рядок0, колонка0, рядок1, колонка1), включно, з нуля
     borders: list = field(default_factory=list)  # прямокутники з рамкою, у тому ж форматі
     meta: list = field(default_factory=list)  # положення таблиць на аркуші "1 в 1" (для підказки налаштувань 1С)
+    lines: list = field(default_factory=list)  # текст аркуша по рядках (реквізити друкованої форми Excel)
+    selected: bool = True  # чи обирати в списку за замовчуванням
 
     @property
     def n_rows(self):
@@ -36,14 +38,21 @@ def is_pdf(path):
 
 
 def load_excel_tables(path):
-    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-    try:
-        return [
-            Table(name, [list(r) for r in wb[name].iter_rows(values_only=True)])
-            for name in wb.sheetnames
-        ]
-    finally:
-        wb.close()
+    """Аркуші Excel. Якщо аркуш - друкована форма (заголовок, таблиця з шапкою, підсумки), першою
+    йде знайдена таблиця (з реквізитами в lines), а весь аркуш додається другим і не обирається."""
+    tables = []
+    for name, values, merges in excelforms.read_grids(path):
+        whole = Table(name, [list(r) for r in values])
+        found = excelforms.detect_table(values, merges)
+        if not found:
+            tables.append(whole)
+            continue
+        rows, head_merges = found
+        tables.append(Table(f"{name}: таблиця", rows, head_merges, lines=excelforms.sheet_lines(values)))
+        whole.name = f"{name}: весь аркуш"
+        whole.selected = False
+        tables.append(whole)
+    return tables
 
 
 # --------------------------------------------------------------------------- PDF
@@ -119,19 +128,31 @@ def _line_tables(page):
 
 def _line_cells(page):
     """Слова сторінки -> [(top, [[x0, x1, текст], ...])]: рядки за вертикаллю, комірки за проміжками."""
-    words = page.extract_words(keep_blank_chars=False, use_text_flow=False, x_tolerance=1.5, y_tolerance=2)
+    return _line_cells_from_words(
+        page.extract_words(keep_blank_chars=False, use_text_flow=False, x_tolerance=1.5, y_tolerance=2)
+    )
+
+
+def _line_cells_from_words(words):
+    """Те саме для списку слів {text, x0, x1, top, bottom} - від pdfplumber або від OCR."""
+    words = [dict(w) for w in words if str(w.get("text", "")).strip()]
     if not words:
         return []
     heights = sorted(w["bottom"] - w["top"] for w in words)
     gap_threshold = max(6.0, 0.9 * heights[len(heights) // 2])
 
-    words.sort(key=lambda w: (w["top"], w["x0"]))
-    lines = []
+    # рядки за вертикальним центром: допуск пропорційний висоті тексту (OCR-рамки слів мають різну висоту)
+    tolerance = max(3.0, 0.45 * heights[len(heights) // 2])
+    words.sort(key=lambda w: ((w["top"] + w["bottom"]) / 2, w["x0"]))
+    lines, centers = [], []
     for w in words:
-        if lines and abs(w["top"] - lines[-1][0]["top"]) <= 3:
+        center = (w["top"] + w["bottom"]) / 2
+        if lines and abs(center - centers[-1] / len(lines[-1])) <= tolerance:
             lines[-1].append(w)
+            centers[-1] += center
         else:
             lines.append([w])
+            centers.append(center)
 
     result = []
     for ln in lines:
@@ -143,7 +164,7 @@ def _line_cells(page):
                 cells[-1][2] += " " + w["text"]
             else:
                 cells.append([w["x0"], w["x1"], w["text"]])
-        result.append((ln[0]["top"], cells))
+        result.append((min(w["top"] for w in ln), cells))
     return result
 
 
@@ -151,7 +172,15 @@ def _text_tables(page):
     """Таблиці без ліній: слова групуються в рядки за вертикаллю, у комірки - за невеликими
     проміжками, колонки - за перекриттям комірок по горизонталі. Блок = послідовні рядки
     принаймні з двома комірками (мінімум 3 рядки)."""
-    line_cells = [cells for _, cells in _line_cells(page)]
+    return _tables_from_line_cells([cells for _, cells in _line_cells(page)])
+
+
+def tables_from_words(words):
+    """Таблиці без ліній зі слів із координатами (сторінка PDF, результат OCR скану чи фото)."""
+    return _tables_from_line_cells([cells for _, cells in _line_cells_from_words(words)])
+
+
+def _tables_from_line_cells(line_cells):
     if not line_cells:
         return []
 

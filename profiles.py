@@ -2,6 +2,7 @@
 Профілі виходу для 1С-обробок імпорту: фіксована розкладка колонок, авто-підбір колонок
 за заголовками, збереження вибору по постачальнику.
 """
+import difflib
 import json
 import os
 import re
@@ -36,16 +37,32 @@ PROFILES = {
 _ALIASES = [
     ("Артикул", r"артикул|^арт\.?$|sku|article", None),
     ("Штрихкод", r"штрих|\bean\b|barcode", None),
-    ("УКТВЭД", r"укт\s?зед|укт\s?вэд|уктвэд", None),
+    ("УКТВЭД", r"укт\s?зед|укт\s?вэд|укт\s?вед|уктвэд", None),
     ("Код", r"^код\b|^code$", r"єдрпоу|укт"),
     ("НомерСтроки", r"^№|^n$|^п/п|^#$|^no\.?$", None),
-    ("Количество", r"к[іi]льк|кол-?во|количеств|к-сть|\bqty\b|quantity", r"_2$"),
+    ("Количество", r"к[іi]льк|к[іi]л-?сть|кол-?во|количеств|к-сть|\bqty\b|quantity", r"_2$"),
     ("Единица", r"^од\.?$|одиниц|^ед\.?$|единиц|\bunit\b|^од\.? ?вим|^ед\.? ?изм", None),
     ("Цена", r"ц[іi]на|цена|price", None),
     ("Сумма", r"^сума|^сумма|^вс[іе]го|^всього|вартість|стоимость|amount|^total", r"пдв|ндс|vat"),
-    ("ПроцентСкидкиНаценки", r"знижк|скидк|discount", None),
+    ("ПроцентСкидкиНаценки", r"знижк\w*\s*%|%\s*знижк|скидк\w*\s*%|%\s*скидк|discount\s*%", None),
     ("Наименование", r"товар|найменув|назва|наименов|номенклатур|опис|description|\bname\b|послуг", None),
 ]
+_FUZZY_WORDS = {
+    "Количество": ("кількість", "количество", "кіл-сть"),
+    "Наименование": ("товари", "товар", "найменування", "назва", "наименование"),
+    "Цена": ("ціна", "цена"),
+    "Сумма": ("сума", "сумма"),
+}
+
+
+def _fuzzy(header, field):
+    """Нечітка відповідність для заголовків зі спотвореннями OCR ('Юлькість' ~ 'кількість')."""
+    tokens = re.findall(r"[а-яіїєґ'a-z-]{3,}", header.lower())
+    return any(
+        difflib.SequenceMatcher(None, t, w).ratio() >= 0.72 for t in tokens for w in _FUZZY_WORDS[field]
+    )
+
+
 _UNIT_RE = re.compile(
     r"^(шт|кг|г|л|мл|м|м2|м3|упак|уп|пач|компл|пар|рул|бут|кор|пак|од|уп\.|шт\.|кг\.|м\.|л\.)\.?$", re.I
 )
@@ -83,7 +100,7 @@ def detect_mapping(headers, data_rows, fields):
         result[wanted[field]] = heads[i]
 
     for field, include, exclude in _ALIASES:
-        if field not in wanted or result[wanted[field]]:
+        if field in ("Цена", "Сумма") or field not in wanted or result[wanted[field]]:
             continue
         for i, h in enumerate(low):
             if i in used or not h:
@@ -97,6 +114,26 @@ def detect_mapping(headers, data_rows, fields):
 
     def column(i):
         return [str(r[i]).strip() for r in data_rows if i < len(r) and str(r[i]).strip()]
+
+    for field in ("Количество", "Наименование"):
+        if field in wanted and not result[wanted[field]]:
+            for i, h in enumerate(low):
+                if i not in used and h and _fuzzy(h, field):
+                    assign(field, i)
+                    break
+
+    qty_header = result.get(wanted.get("Количество")) if "Количество" in wanted else None
+    qty_idx = next((i for i, h in enumerate(heads) if qty_header and h == qty_header), None)
+    price_i, sum_i = _pick_price_sum(low, used, data_rows, qty_idx)
+    for field, i in (("Цена", price_i), ("Сумма", sum_i)):
+        if i is not None and field in wanted:
+            assign(field, i)
+    qty_known = qty_idx
+    qty_i, price_i = _infer_columns(len(heads), used, data_rows, qty_known, price_i, sum_i)
+    if "Количество" in wanted and not result[wanted["Количество"]] and qty_i is not None:
+        assign("Количество", qty_i)
+    if "Цена" in wanted and not result[wanted["Цена"]] and price_i is not None:
+        assign("Цена", price_i)
 
     if "Единица" in wanted and not result[wanted["Единица"]]:
         for i in range(len(heads)):
@@ -120,6 +157,103 @@ def detect_mapping(headers, data_rows, fields):
         if best is not None and best_len >= 6:
             assign("Наименование", best)
     return result
+
+
+_PRICE_RE = r"ц[іi]на|цена|price"
+_SUM_RE = r"^сума|^сумма|^вс[іе]го|^всього|вартість|стоимость|amount|^total"
+
+
+def _is_vat(header):
+    return bool(re.search(r"пдв|ндс|vat", header)) and not re.search(r"без\s*(пдв|ндс)|without vat", header)
+
+
+def _decimal(value):
+    n = converter.normalize_number(str(value)).replace(" ", "").replace("\u00a0", "")
+    try:
+        return Decimal(n)
+    except InvalidOperation:
+        return None
+
+
+def _pick_price_sum(low, used, data_rows, qty_idx):
+    """Ціна й сума, що узгоджуються з кількістю (кількість × ціна = сума). У формах зі знижкою є
+    кілька пар (ціна/сума до і після знижки) - вибирається остання (права) з узгоджених, без ПДВ."""
+    prices = [i for i, h in enumerate(low) if i not in used and h and re.search(_PRICE_RE, h)]
+    sums = [i for i, h in enumerate(low) if i not in used and h and re.search(_SUM_RE, h)]
+    if not prices:
+        prices = [i for i, h in enumerate(low) if i not in used and h and _fuzzy(h, "Цена")]
+    if not sums:
+        sums = [i for i, h in enumerate(low) if i not in used and h and _fuzzy(h, "Сумма")]
+    prices = [i for i in prices if not _is_vat(low[i])] or prices
+    sums = [i for i in sums if not _is_vat(low[i])] or sums
+    if not prices or not sums:
+        return (prices[0] if prices else None), (sums[0] if sums else None)
+    if qty_idx is None:
+        return prices[0], sums[0]
+
+    def cell(row, i):
+        return _decimal(row[i]) if i < len(row) and str(row[i]).strip() else None
+
+    best, best_key = (prices[0], sums[0]), None
+    for p in prices:
+        for s_ in sums:
+            ok = total = 0
+            for row in data_rows[:200]:
+                q, pr, sm = cell(row, qty_idx), cell(row, p), cell(row, s_)
+                if q is None or pr is None or sm is None:
+                    continue
+                total += 1
+                diff = abs(q * pr - sm)
+                if diff <= Decimal("0.02") or diff <= abs(sm) * Decimal("0.005"):
+                    ok += 1
+            key = ((ok / total) if total else 0, s_, p)
+            if best_key is None or key > best_key:
+                best, best_key = (p, s_), key
+    return best
+
+
+def _consistency(data_rows, q_i, p_i, s_i):
+    """(частка рядків, де кількість × ціна = сума; кількість перевірених рядків)."""
+    ok = total = 0
+    for row in data_rows[:200]:
+        vals = [_decimal(row[j]) if j < len(row) and str(row[j]).strip() else None for j in (q_i, p_i, s_i)]
+        if None in vals:
+            continue
+        total += 1
+        diff = abs(vals[0] * vals[1] - vals[2])
+        if diff <= Decimal("0.02") or diff <= abs(vals[2]) * Decimal("0.005"):
+            ok += 1
+    return (ok / total if total else 0.0), total
+
+
+def _infer_columns(n_cols, used, data_rows, qty_i, price_i, sum_i):
+    """Колонки кількості й ціни за вмістом (коли заголовки відсутні або спотворені OCR): за відомою сумою
+    шукаються колонки, що дають кількість × ціна = сума майже в усіх рядках. Якщо невідомі обидві,
+    кількість - ліва колонка пари. Повертає (кількість, ціна) з уже відомих або знайдених."""
+    free = [i for i in range(n_cols) if i not in used and i not in (qty_i, price_i, sum_i)]
+
+    min_rows = 1 if len(data_rows) == 1 else 2
+
+    def best(candidates):
+        top, top_score = None, 0.0
+        for cand in candidates:
+            score, total = cand[1], cand[2]
+            if total >= min_rows and score >= 0.8 and score > top_score:
+                top, top_score = cand[0], score
+        return top
+
+    if sum_i is None:
+        return qty_i, price_i
+    if qty_i is not None and price_i is None:
+        price_i = best([(j, *_consistency(data_rows, qty_i, j, sum_i)) for j in free])
+    elif price_i is not None and qty_i is None:
+        qty_i = best([(i, *_consistency(data_rows, i, price_i, sum_i)) for i in free])
+    elif qty_i is None and price_i is None:
+        pairs = [((i, j), *_consistency(data_rows, i, j, sum_i)) for i in free for j in free if i < j]
+        pair = best(pairs)
+        if pair:
+            qty_i, price_i = pair
+    return qty_i, price_i
 
 
 # ------------------------------------------------------------------ збереження вибору по постачальнику

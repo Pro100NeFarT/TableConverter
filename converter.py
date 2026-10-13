@@ -133,7 +133,10 @@ def _fill_merges(rows, merges):
 def _clean_value(v, flatten_newlines, sanitize_quotes, normalize_numbers, replace_char=None):
     if v is None:
         return ""
-    s = str(v)
+    if isinstance(v, float):
+        s = str(int(v)) if v.is_integer() else repr(v)
+    else:
+        s = str(v)
     if flatten_newlines:
         s = s.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     if sanitize_quotes:

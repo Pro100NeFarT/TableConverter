@@ -4,6 +4,7 @@
 """
 import csv
 import io
+import json
 import os
 import queue
 import sys
@@ -18,6 +19,7 @@ import checks
 import converter
 import docinfo
 import hints
+import jsonexport
 import ocr_rapid
 import ocr_windows
 import profiles
@@ -199,6 +201,9 @@ class App(tk.Tk):
         ).pack(side="left", padx=8)
         ttk.Radiobutton(
             fmt_frame, text="Excel (.xlsx)", value="xlsx", variable=self.format_var, command=self._on_format_change
+        ).pack(side="left", padx=8)
+        ttk.Radiobutton(
+            fmt_frame, text="JSON (для 1С)", value="json", variable=self.format_var, command=self._on_format_change
         ).pack(side="left", padx=8)
         self.only_table_var = tk.BooleanVar(value=False)
         self.only_table_cb = ttk.Checkbutton(
@@ -492,7 +497,8 @@ class App(tk.Tk):
         ):
             cb.configure(state="normal" if is_csv else "disabled")
         is_pdf = bool(self.file_path) and sources.is_pdf(self.file_path) and not self._ocr_source
-        self.only_table_cb.configure(state="normal" if (not is_csv and is_pdf) else "disabled")
+        is_xlsx = self.format_var.get() == "xlsx"
+        self.only_table_cb.configure(state="normal" if (is_xlsx and is_pdf) else "disabled")
         self.update_preview()
 
     def reload(self):
@@ -684,8 +690,12 @@ class App(tk.Tk):
             )
         return converter.prepare_rows(table.rows, table.merges, **opts)
 
+    def map_profile(self):
+        """Профіль, за яким підбираються колонки: обраний; для JSON - завжди УпрИмпортИзExcel."""
+        return "upr" if self.format_var.get() == "json" else self.profile_key()
+
     def mapping_for(self, table):
-        key = (table.name, self.profile_key() or "none")
+        key = (table.name, self.map_profile() or "none")
         if key not in self.user_mapping:
             prepared = self.prepare_table(table)
             self.user_mapping[key] = (
@@ -700,7 +710,14 @@ class App(tk.Tk):
             return profiles.apply_profile(prepared, key, self.mapping_for(table)) if prepared else []
         return converter.prepare_rows(table.rows, table.merges, **self._csv_options())
 
+    def json_preview(self, table, max_items=2):
+        prepared = self.prepare_table(table)
+        items = jsonexport.build_items(prepared, self.mapping_for(table)) if prepared else []
+        return json.dumps(items[:max_items], ensure_ascii=False, indent=1)
+
     def preview_for(self, table, delim=None, max_rows=5):
+        if self.format_var.get() == "json":
+            return self.json_preview(table)
         key = self._active_profile()
         delim = delim or self.get_selected_delimiter() or (profiles.PROFILES[key]["delimiter"] if key else ";")
         buf = io.StringIO()
@@ -733,7 +750,7 @@ class App(tk.Tk):
 
     def _open_columns(self):
         tables = self.selected_tables()
-        if not self.profile_key():
+        if not self.map_profile():
             messagebox.showinfo("Колонки", "Спершу оберіть профіль для 1С.")
             return
         if not tables:
@@ -755,6 +772,8 @@ class App(tk.Tk):
 
     def assistant_hints(self):
         tables = self.selected_tables()
+        if self.format_var.get() == "json":
+            return hints.json_lines(self.json_document(tables)) if tables else ["Оберіть таблицю."]
         if self.format_var.get() == "csv":
             key = self.profile_key()
             if not key:
@@ -850,7 +869,7 @@ class App(tk.Tk):
         tables = self.selected_tables()
         key = self._active_profile()
         delim = self.get_selected_delimiter() or (
-            profiles.PROFILES[key]["delimiter"] if key else ("\t" if self.format_var.get() == "xlsx" else None)
+            profiles.PROFILES[key]["delimiter"] if key else ("\t" if self.format_var.get() in ("xlsx", "json") else None)
         )
         if not tables or not delim:
             return
@@ -879,6 +898,49 @@ class App(tk.Tk):
             fill_merges=self.fill_merges_var.get(),
             normalize_numbers=self.numbers_var.get(),
         )
+
+    def json_source(self):
+        info = {"Файл": os.path.basename(self.file_path or ""), "Программа": f"TableConverter {app_version.APP_VERSION}"}
+        if self._ocr_source:
+            info["Тип"] = "scan"
+            info["OCR"] = True
+        else:
+            info["Тип"] = "pdf" if sources.is_pdf(self.file_path or "") else "excel"
+        return info
+
+    def json_document(self, tables):
+        data = [(self.prepare_table(t), self.mapping_for(t), t.name) for t in tables]
+        return jsonexport.build_document(self.doc_info, data, self.json_source())
+
+    def _save_json(self, base_dir, base_name):
+        tables = self.selected_tables()
+        if not tables:
+            messagebox.showwarning("Увага", "Оберіть хоча б одну таблицю.")
+            return
+        document = self.json_document(tables)
+        errors = [m["Сообщение"] for m in document["Контроль"] if m["Уровень"] == "error"]
+        if errors and not messagebox.askyesno(
+            "Контроль виявив помилки", "\n\n".join(errors) + "\n\nВсе одно зберегти?"
+        ):
+            self._show_info()
+            return
+        out_path = filedialog.asksaveasfilename(
+            title="Зберегти JSON як",
+            initialdir=base_dir,
+            initialfile=f"{base_name}.json",
+            defaultextension=".json",
+            filetypes=[("JSON файли", "*.json")],
+        )
+        if not out_path:
+            return
+        try:
+            jsonexport.write_json(document, out_path)
+        except Exception as exc:
+            messagebox.showerror("Помилка", f"Не вдалося зберегти JSON:\n{exc}")
+            return
+        self.status_var.set(f"Готово: збережено {out_path}")
+        messagebox.showinfo("Готово", f"JSON збережено:\n{out_path}")
+        self._show_info("hints")
 
     def _save_xlsx(self, base_dir, base_name):
         full_page = sources.is_pdf(self.file_path) and not self._ocr_source and not self.only_table_var.get()
@@ -920,6 +982,9 @@ class App(tk.Tk):
 
         if self.format_var.get() == "xlsx":
             self._save_xlsx(base_dir, base_name)
+            return
+        if self.format_var.get() == "json":
+            self._save_json(base_dir, base_name)
             return
 
         tables = self.selected_tables()

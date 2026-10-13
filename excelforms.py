@@ -23,6 +23,18 @@ def _norm(value):
     return " ".join(str(value).split()).lower() if value is not None else ""
 
 
+def _is_numeric(value):
+    return isinstance(value, (int, float)) or bool(re.fullmatch(r"[\d\s.,\-]+", str(value)))
+
+
+def _split_vat_header(text):
+    """'Ціна без / з ПДВ, грн.' -> ('Ціна без ПДВ, грн.', 'Ціна з ПДВ, грн.'); інакше друга колонка - '(2)'."""
+    pattern = re.compile(r"без\s*/\s*з\s*(пдв|ндс)", re.I)
+    if pattern.search(text):
+        return pattern.sub(lambda m: f"без {m.group(1)}", text), pattern.sub(lambda m: f"з {m.group(1)}", text)
+    return text, f"{text} (2)"
+
+
 def _num(value):
     return int(value) if isinstance(value, float) and value.is_integer() else value
 
@@ -133,7 +145,7 @@ def detect_table(values, merges):
     def filled(row, span):
         return any(row[c] is not None and str(row[c]).strip() != "" for c in range(span[0], min(span[1] + 1, len(row))))
 
-    items = []
+    items, cont = [], {}  # cont: рядок товару -> рядок продовження (друга пара ціни/суми "з ПДВ")
     for r in range(data_start, len(values)):
         row = values[r]
         texts = [v for v in row if v is not None and str(v).strip() != ""]
@@ -144,24 +156,41 @@ def detect_table(values, merges):
         if any(isinstance(v, str) and _TOTAL_RE.match(_norm(v)) for v in texts):
             break
         if not (filled(row, name_span) or filled(row, qty_span)):
+            if items and r == items[-1] + 1 and items[-1] not in cont and all(_is_numeric(v) for v in texts):
+                cont[items[-1]] = r
+                continue
             if items:
                 break
             continue
         items.append(r)
     if not items:
         return None
+    if len(cont) < max(1, len(items) // 2):
+        cont = {}
 
-    columns, head_row, head_merges = [], [], []
+    def cell(r, c):
+        return values[r][c] if 0 <= r < len(values) and c < len(values[r]) else None
+
+    columns, head_row, head_merges = [], [], []  # columns: (колонка, з рядка продовження?)
     for c, text, c1 in header:
         anchors = sorted(
             {cc for r in items for cc in range(c, min(c1 + 1, len(values[r]))) if values[r][cc] is not None and str(values[r][cc]).strip() != ""}
         ) or [c]
+        if len(anchors) == 1 and any(cell(cont[r], anchors[0]) not in (None, "") for r in cont):
+            first, second = _split_vat_header(text)
+            columns += [(anchors[0], False), (anchors[0], True)]
+            head_row += [first, second]
+            continue
         start = len(columns)
         for k, anchor in enumerate(anchors):
-            columns.append(anchor)
+            columns.append((anchor, False))
             head_row.append(text if k == 0 else "")
         if len(anchors) > 1:
             head_merges.append((0, start, 0, start + len(anchors) - 1))
 
-    rows = [head_row] + [[_num(values[r][c]) if c < len(values[r]) else None for c in columns] for r in items]
+    rows = [head_row] + [
+        [_num(cell(cont[r], c) if (second and r in cont) else cell(r, c)) if not (second and r not in cont) else None
+         for c, second in columns]
+        for r in items
+    ]
     return rows, head_merges

@@ -3,6 +3,7 @@
 Кожне джерело повертає список Table(name, rows), далі працює спільний конвеєр.
 """
 import os
+import re
 from dataclasses import dataclass, field
 
 import excelforms
@@ -249,6 +250,34 @@ def _header_key(row):
     return [c.lower() for c in row]
 
 
+def trim_form_frame(rows, merges):
+    """Рамка друкованої форми може захопити заголовок документа над шапкою таблиці й підсумки під нею
+    (одна об'єднана комірка на всю ширину). Такі рядки відкидаються; шапка стає першим рядком."""
+    def texts(row):
+        return [excelforms._norm(c) for c in row if str(c).strip()]
+
+    header = None
+    for r, row in enumerate(rows):
+        t = texts(row)
+        found = {g for g, p in excelforms._GROUPS.items() if any(re.search(p, x) for x in t)}
+        if {"name", "qty"} <= found and found & {"price", "sum"}:
+            header = r
+            break
+    if header is None:
+        return rows, merges
+    end = len(rows)
+    while end - 1 > header:
+        t = texts(rows[end - 1])
+        full_width = any(r0 == end - 1 and r1 == end - 1 and c1 - c0 + 1 >= len(rows[end - 1]) // 2
+                         for r0, c0, r1, c1 in merges)
+        if len(t) == 1 and (full_width or excelforms._TOTAL_RE.match(t[0])):
+            end -= 1
+        else:
+            break
+    kept = [(r0 - header, c0, r1 - header, c1) for r0, c0, r1, c1 in merges if r0 >= header and r1 < end]
+    return rows[header:end], kept
+
+
 def pdf_tables_to_tables(found, merge_continued=True):
     """Перетворює знайдене на Table; опційно склеює таблиці, що тривають на наступній сторінці
     (та сама кількість колонок, перша на сторінці, попередня — остання на своїй сторінці),
@@ -298,7 +327,8 @@ def pdf_tables_to_tables(found, merge_continued=True):
             pages = f"Стор. {g['first_page']}"
         else:
             pages = f"Стор. {g['first_page']}-{g['last_page']}"
-        tables.append(Table(f"{pages}, табл. {g['idx']}", g["rows"], g["merges"]))
+        rows, merges = trim_form_frame(g["rows"], g["merges"])
+        tables.append(Table(f"{pages}, табл. {g['idx']}", rows, merges))
     return tables
 
 

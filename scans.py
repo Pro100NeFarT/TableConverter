@@ -28,6 +28,7 @@ _FORM_WORDS = {
     "sum": ("сума", "вартість"),
 }
 _TOTAL_LINE = re.compile(r"^\s*(разом|всього|усього|итого|всего|загальна\s+вартість|total)\b", re.IGNORECASE)
+_UNIT_CELL = re.compile(r"^(?:\d{1,4}\s*)?[^\d\s.,]{1,6}\.?$")
 _QTY_UNIT = re.compile(r"^(\d[\d\s.,]*?)\s+([^\d\s.,]\S{0,7})$")
 
 
@@ -98,6 +99,32 @@ def fix_words(words):
     return fixed
 
 
+_LOOKALIKE_LETTERS = {k: v for k, v in _LOOKALIKE.items() if not chr(k).isdigit()}
+
+
+def fix_unit(unit):
+    """Одиниця виміру після OCR: 'шT' -> 'шт', '1оо шт' -> '100 шт'."""
+    unit = str(unit).strip()
+    if re.search(r"[A-Za-z]", unit):
+        unit = unit.translate(_LOOKALIKE_LETTERS).lower()
+    m = re.match(r"^([\dОоOo]{1,5})\s*([^\d\s.,]{1,6}\.?)$", unit)
+    if m and re.search(r"\d", m.group(1).translate(_DIGIT_CONFUSABLE)):
+        return f"{m.group(1).translate(_DIGIT_CONFUSABLE)} {m.group(2)}"
+    return unit
+
+
+def fix_mixed_script(text):
+    """Слова з кирилиці з окремими латинськими літерами ('вiд', 'BД') - латинські літери замінюються
+    кириличними двійниками."""
+    def fix(match):
+        token = match.group(0)
+        cyr = len(re.findall(r"[А-Яа-яІіЇїЄєҐґ]", token))
+        lat = len(re.findall(r"[A-Za-z]", token))
+        return token.translate(_LOOKALIKE_LETTERS) if cyr and lat and lat <= cyr else token
+
+    return re.sub(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]+", fix, text)
+
+
 def fix_rows(rows):
     return [[fix_numeric_cell(c) for c in row] for row in rows]
 
@@ -131,8 +158,21 @@ def recognize_image(img, lang="uk", engine="auto"):
 
 
 def lines_from_words(words):
-    """Текст сторінки по рядках для зчитування реквізитів (комірки розділені табуляцією)."""
-    return ["\t".join(cell[2] for cell in cells) for _, cells in sources._line_cells_from_words(words)]
+    """Текст сторінки по рядках для зчитування реквізитів (комірки розділені табуляцією). Рядок із двома-трьома
+    сумами одразу під таблицею (без підпису) стає 'Разом: без ПДВ з ПДВ'."""
+    lines, seen_table = [], False
+    for _, cells in sources._line_cells_from_words(words):
+        texts = [str(fix_numeric_cell(c[2])).strip() for c in cells]
+        numeric = [_is_number(t) for t in texts]
+        if all(numeric) and 2 <= len(texts) <= 3 and all(re.search(r"[.,]\d{2}$", t) for t in texts) and seen_table:
+            lines.append("Разом: " + " ".join(texts))
+            seen_table = False
+            continue
+        if sum(numeric) >= 4:
+            seen_table = True
+        line = fix_mixed_script("\t".join(c[2] for c in cells))
+        lines.append(re.sub(r"(№\s*)([А-ЯІЇЄA-Z][а-яіїєa-z]{1,3})(?=[-/]?\d)", lambda m: m.group(1) + m.group(2).upper(), line))
+    return lines
 
 
 def _fuzzy_any(text, words, threshold=0.72):
@@ -144,15 +184,45 @@ def _is_number(text):
     return bool(_NUMBER.match(text.replace("\u00a0", " ").strip()))
 
 
-def _parse_form_row(cells, expected):
-    """Рядок таблиці-форми за вмістом: [№, назва, кількість, одиниця, ціна, сума] або None (немає чисел)."""
+def _header_groups(texts):
+    """Порядок числових колонок за словами шапки: ['qty', 'price', 'price', 'sum', 'sum'] ('Кількість Ціна без
+    Ціна з Сума без Сума з')."""
+    order = []
+    for token in re.findall(r"[а-яіїєґ'a-z0-9-]{3,}", " ".join(texts).lower()):
+        for group in ("qty", "price", "sum"):
+            if any(difflib.SequenceMatcher(None, token, w).ratio() >= 0.72 for w in _FORM_WORDS[group]):
+                order.append(group)
+                break
+    return order
+
+
+def _numeric_header(order):
+    """Назви колонок: одна ціна/сума - 'Ціна', 'Сума'; дві - 'без ПДВ' і 'з ПДВ'; більше - з номером."""
+    names = []
+    for group, base in (("price", "Ціна"), ("sum", "Сума")):
+        count = order.count(group)
+        if count == 1:
+            names.append(base)
+        elif count == 2:
+            names += [f"{base} без ПДВ", f"{base} з ПДВ"]
+        else:
+            names += [base if k == 0 else f"{base}_{k + 1}" for k in range(count)]
+    return names
+
+
+def _parse_form_row(cells, expected, next_index=None):
+    """Рядок таблиці-форми за вмістом: [№, назва, кількість, одиниця, ціни..., суми...] або None (немає чисел).
+    expected - порядок числових колонок шапки ('qty', 'price', 'sum'...); зайві числа ліворуч (як '100' в
+    одиниці '100 шт') належать одиниці."""
     items = []  # (x0, 'num'|'text', значення)
+    glued = {}  # x0 числа -> '100 шт'
     for x0, _x1, text in cells:
         fixed = str(fix_numeric_cell(text)).strip()
         m = _QTY_UNIT.match(fixed)
         if m and _is_number(m.group(1)):
             items.append((x0, "num", m.group(1).strip()))
             items.append((x0 + 1, "text", m.group(2)))
+            glued[x0] = f"{m.group(1).strip()} {m.group(2)}"
         elif _is_number(fixed):
             items.append((x0, "num", fixed))
         else:
@@ -160,40 +230,75 @@ def _parse_form_row(cells, expected):
     index = ""
     if len(items) >= 3 and items[0][1] == "num" and re.fullmatch(r"\d{1,3}", items[0][2]):
         index = items.pop(0)[2]
+    elif items and items[0][1] == "text" and next_index is not None:
+        m = re.match(rf"^{next_index}\s+(\S.*)$", items[0][2])
+        if m and any(i[1] == "num" for i in items[1:]):
+            index = str(next_index)
+            items[0] = (items[0][0], "text", m.group(1))
     numbers = [i for i in items if i[1] == "num"]
     if not numbers:
         return None
-    count = min(len(numbers), 3)
-    targets = expected if len(expected) == len(numbers) else ("qty", "price", "sum")[-count:] if count > 2 else ("price", "sum")[-count:]
-    values = {g: n[2] for g, n in zip(targets, numbers[-len(targets):])}
-    texts = [i for i in items if i[1] == "text"]
+    need = len(expected)
     unit = ""
-    for t in texts[1:]:
-        if len(t[2]) <= 8 and not any(ch.isdigit() for ch in t[2]) and t[0] > numbers[0][0]:
-            unit = t[2]
-            break
+    if need >= 4 and len(numbers) > need:
+        extra = numbers[: len(numbers) - need]
+        numbers = numbers[len(numbers) - need:]
+        if extra[0][0] in glued:
+            unit = glued[extra[0][0]]
+            items = [i for i in items if not (i[0] == extra[0][0] + 1 and i[1] == "text")]
+        targets = list(expected)
+    elif len(numbers) == need:
+        targets = list(expected)
+    else:
+        count = min(len(numbers), 3)
+        targets = ["qty", "price", "sum"][-count:] if count > 2 else ["price", "sum"][-count:]
+        numbers = numbers[-len(targets):]
+    values = {"qty": "", "price": [], "sum": []}
+    for group, n in zip(targets, numbers):
+        if group == "qty":
+            values["qty"] = n[2]
+        else:
+            values[group].append(n[2])
+    texts = [i for i in items if i[1] == "text"]
+    if not unit:
+        for t in texts[1:]:
+            if len(t[2]) <= 8 and (not any(ch.isdigit() for ch in t[2]) or _UNIT_CELL.match(t[2])):
+                unit = t[2]
+                break
     name = " ".join(t[2] for t in texts if t[2] != unit or t is texts[0])
-    return [index, name.strip(), values.get("qty", ""), unit, values.get("price", ""), values.get("sum", "")]
+    n_price = max(sum(1 for g in expected if g == "price"), len(values["price"]), 1)
+    n_sum = max(sum(1 for g in expected if g == "sum"), len(values["sum"]), 1)
+    prices = (values["price"] + [""] * n_price)[:n_price]
+    sums = (values["sum"] + [""] * n_sum)[:n_sum]
+    return [index, name.strip(), values["qty"], unit, *prices, *sums]
 
 
 def form_table_from_words(words, name):
     """Таблиця друкованої форми (акт, рахунок) за заголовком і вмістом: знаходить рядок шапки за ключовими
     словами (з допуском на помилки OCR; достатньо 'Найменування' + 'Сума'), потім рядки з числами до
-    рядка 'Разом'. Працює й для таблиці з одним рядком. Назви колонок канонічні."""
+    рядка 'Разом'. Працює й для таблиці з одним рядком і для кількох колонок цін/сум (без ПДВ / з ПДВ);
+    назва товару на кілька рядків склеюється. Назви колонок канонічні."""
     lines = sources._line_cells_from_words(words)
     for h, (_top, cells) in enumerate(lines):
         groups = {g for g, ws in _FORM_WORDS.items() if any(_fuzzy_any(c[2], ws) for c in cells)}
         if len(cells) < 2 or "name" not in groups or not groups & {"qty", "price", "sum"}:
             continue
-        expected = tuple(g for g in ("qty", "price", "sum") if g in groups)
+        order = _header_groups([c[2] for c in cells])
+        if len(order) >= 4 and order.count("qty") == 1:  # кілька колонок цін/сум (без ПДВ / з ПДВ)
+            expected, out_groups = tuple(order), list(order)
+        else:
+            expected, out_groups = tuple(g for g in ("qty", "price", "sum") if g in groups), ["qty", "price", "sum"]
         rows, name_x = [], None
         for _t, row_cells in lines[h + 1:]:
             if _TOTAL_LINE.match(" ".join(c[2] for c in row_cells)):
                 break
-            parsed = _parse_form_row(row_cells, expected)
+            parsed = _parse_form_row(row_cells, expected, len(rows) + 1)
+            if parsed and rows and not parsed[0] and not parsed[1]:
+                break  # рядок підсумків без назви (суми під таблицею)
             if parsed:
                 rows.append(parsed)
-                name_x = min(c[0] for c in row_cells[1:] or row_cells)
+                lead = row_cells[1] if len(row_cells) > 1 and re.fullmatch(r"\d{1,3}", row_cells[0][2].strip()) else row_cells[0]
+                name_x = lead[0]
                 continue
             if rows and len(row_cells) == 1 and name_x is not None and abs(row_cells[0][0] - name_x) <= 80:
                 rows[-1][1] = f"{rows[-1][1]} {row_cells[0][2]}".strip()
@@ -203,7 +308,19 @@ def form_table_from_words(words, name):
         if rows:
             name_cell = next((c[2] for c in cells if _fuzzy_any(c[2], _FORM_WORDS["name"])), "Найменування")
             name_cell = fix_header_text(name_cell)
-            header = ["№", name_cell, "Кількість", "Од.", "Ціна", "Сума"]
+            header = ["№", name_cell, "Кількість", "Од."] + _numeric_header(out_groups)
+            width = len(header)
+            rows = [(r + [""] * width)[:width] for r in rows]
+            for r in rows:
+                r[3] = fix_unit(r[3])
+            units = {r[3] for r in rows if r[3]}
+            for r in rows:  # одиниця '100 шт', злита з назвою
+                if not r[3]:
+                    for u in units:
+                        m = re.search(r"\s" + re.escape(u) + r"(?=\s|\(|$)", r[1])
+                        if m:
+                            r[3], r[1] = u, (r[1][: m.start()] + r[1][m.end():]).strip()
+                            break
             return sources.Table(f"{name}, табл. 1 (за заголовком)", [header] + rows)
     return None
 

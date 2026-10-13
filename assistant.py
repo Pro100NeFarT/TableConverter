@@ -110,7 +110,7 @@ class ColumnsDialog(tk.Toplevel):
         self.app, self.table = app, table
         self.title(f"Колонки профілю - {table.name}")
         self.transient(app)
-        self.profile_key = app.profile_key() or "none"
+        self.profile_key = app.map_profile() or "none"
         prepared = app.prepare_table(table)
         self.headers = [h for h in dict.fromkeys(str(h).strip() for h in prepared[0] if str(h).strip())]
         self.mapping = app.mapping_for(table)

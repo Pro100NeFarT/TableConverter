@@ -93,3 +93,32 @@ def excel_lines_layout(layout_sheets, entries):
     if not found:
         lines.append("Не вдалося співставити обрану таблицю з аркушами - налаштуйте рядки й колонки вручну.")
     return lines
+
+
+def json_lines(document):
+    """Підказка для обробки УпрИмпортИзExcel: що буде заповнено з JSON і що перевірити вручну."""
+    header = document.get("Шапка", {})
+    lines = [
+        "Обробка: УпрИмпортИзExcel (керовані форми)",
+        "",
+        "Як завантажити: у полі «Файл» оберіть цей .json і натисніть «Загрузить».",
+        "Шапка й таблиця заповняться з файлу; пошук номенклатури працює як зазвичай.",
+        "Налаштування колонок, роздільника й рядків для JSON не потрібні.",
+        "",
+        "Що буде заповнено в шапці:",
+    ]
+    seller, contract = header.get("Поставщик"), header.get("Договор")
+    lines.append(f"  Номер вхідного: {header.get('Номер') or '— не знайдено —'}")
+    lines.append(f"  Дата вхідного: {header.get('ДатаТекст') or '— не знайдено —'}")
+    lines.append(
+        "  Контрагент: "
+        + (f"{seller.get('Наименование', '')} (ЄДРПОУ {seller['ЕДРПОУ']})" if seller and seller.get("ЕДРПОУ")
+           else f"{seller.get('Наименование', '')} (ІПН {seller['ИНН']})" if seller and seller.get("ИНН")
+           else (seller or {}).get("Наименование") or "— не знайдено —")
+    )
+    lines.append(f"  Договір: {contract.get('Представление') if contract else '— не знайдено —'}")
+    lines.append(f"Позицій у таблиці: {len(document.get('Товары', []))}")
+    problems = [m["Сообщение"] for m in document.get("Контроль", []) if m["Уровень"] != "ok"]
+    if problems:
+        lines += ["", "Зверніть увагу (вкладка «Контроль»):"] + [f"  - {text}" for text in problems]
+    return lines

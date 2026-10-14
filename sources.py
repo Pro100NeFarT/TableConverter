@@ -23,6 +23,7 @@ class Table:
     borders: list = field(default_factory=list)  # прямокутники з рамкою, у тому ж форматі
     meta: list = field(default_factory=list)  # положення таблиць на аркуші "1 в 1" (для підказки налаштувань 1С)
     lines: list = field(default_factory=list)  # текст аркуша по рядках (реквізити друкованої форми Excel)
+    spans: list = field(default_factory=list)  # (верх, низ) кожного рядка даних на зображенні (для таблиць зі скана)
     selected: bool = True  # чи обирати в списку за замовчуванням
 
     @property

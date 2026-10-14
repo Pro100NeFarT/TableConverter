@@ -116,8 +116,8 @@ def fix_unit(unit):
     unit = str(unit).strip().replace("w", "ш").replace("W", "Ш")
     if unit.lower() in ("et", "ет", "ят", "ut", "uт", "ur", "ит"):
         return "шт"
-    if unit.isupper() and 1 < len(unit) <= 5 and not any(ch.isdigit() for ch in unit):
-        unit = unit.lower()  # ШТ -> шт
+    if 1 < len(unit) <= 5 and not any(ch.isdigit() for ch in unit) and (unit.isupper() or unit.lower() in _KNOWN_UNITS):
+        unit = unit.lower()  # ШТ, Шт -> шт
     m = re.match(r"^(\d[\d\s]*\s)?([^\d\s.,]{2,8})\.?$", unit)
     if m and m.group(2).lower() not in _KNOWN_UNITS and len(m.group(2)) >= 3:
         close = difflib.get_close_matches(m.group(2).lower(), _KNOWN_UNITS, n=2, cutoff=0.66)
@@ -206,6 +206,89 @@ def infer_missing_quantities(tables):
     return ("; ".join(parts)[0].upper() + "; ".join(parts)[1:] + " — перевірте.") if parts else None
 
 
+def weak_rows(table):
+    """Номери (з 1) рядків даних, які OCR міг прочитати погано: порожня чи дуже коротка назва, немає коду, коли в
+    інших рядках він є, кількість × ціна ≠ сума."""
+    header = [str(h) for h in table.rows[0]]
+    rows = table.rows[1:]
+    name_i = 2 if header[1:2] == ["Код"] else 1
+    code_share = sum(1 for r in rows if header[1:2] == ["Код"] and str(r[1]).strip()) / max(len(rows), 1)
+    qty_i = next((i for i, h in enumerate(header) if h.startswith("Кількість")), None)
+    price_i = next((i for i, h in enumerate(header) if h.startswith("Ціна")), None)
+    sum_i = next((i for i, h in enumerate(header) if h.startswith("Сума")), None)
+    weak = []
+    for number, row in enumerate(rows, 1):
+        bad = len(str(row[name_i]).strip()) < 10
+        if header[1:2] == ["Код"] and code_share >= 0.6 and not str(row[1]).strip():
+            bad = True
+        if None not in (qty_i, price_i, sum_i):
+            qty = checks.to_decimal(profiles.split_quantity(row[qty_i])[0])
+            price, total = checks.to_decimal(row[price_i]), checks.to_decimal(row[sum_i])
+            if qty is not None and price is not None and total is not None:
+                diff = abs(qty * price - total)
+                if diff > checks.Decimal("0.02") and diff > abs(total) * checks.Decimal("0.005"):
+                    bad = True
+        if bad:
+            weak.append(number)
+    return weak
+
+
+def reocr_weak_rows(img, words, tables, lang="uk", engine="auto", max_rows=12):
+    """Рядки таблиці з поганим розпізнаванням (OCR інколи губить довгі рядки поруч із рамкою таблиці) розпізнаються
+    окремо: смуга зображення рядка вирізається (у натуральному розмірі й збільшена втричі) і замінює слова цього
+    рядка, якщо від цього стає менше слабких рядків. Повертає (слова, [номери виправлених рядків])."""
+    table = next((t for t in tables if t.selected and t.spans), None)
+    if table is None or resolve_engine(engine) != "rapid":
+        return words, []
+    weak = weak_rows(table)[:max_rows]
+    if not weak:
+        return words, []
+    margin = 6
+    bands = []
+    for number in weak:
+        top, bottom = table.spans[number - 1]
+        bands.append((number, max(0, int(top) - margin), min(img.height, int(bottom) + margin), int(top), int(bottom)))
+    crops, plan = [], []
+    for number, y0, y1, top, bottom in bands:
+        crop = img.crop((0, y0, img.width, y1))
+        for scale in (1, 3):
+            crops.append(crop.resize((crop.width * scale, crop.height * scale)) if scale > 1 else crop)
+            plan.append((number, y0, y1, top, bottom, scale))
+    try:
+        results = ocr_rapid.recognize_many(crops)
+    except Exception:
+        return words, []
+    current, fixed = words, []
+    by_row = {}
+    for (number, y0, y1, top, bottom, scale), (new_words, _info) in zip(plan, results):
+        by_row.setdefault(number, []).append((y0, top, bottom, scale, new_words))
+    for number, variants in by_row.items():
+        base_weak = len(weak_rows(next(t for t in tables_from_image_words(current, "x") if t.selected)))
+        best, best_weak = None, base_weak
+        for y0, top, bottom, scale, new_words in variants:
+            mapped = []
+            for w in new_words:
+                cy = y0 + (w["top"] + w["bottom"]) / 2 / scale
+                if top - 2 <= cy <= bottom + 2:
+                    mapped.append(dict(w, x0=w["x0"] / scale, x1=w["x1"] / scale, top=y0 + w["top"] / scale,
+                                       bottom=y0 + w["bottom"] / scale))
+            kept = [w for w in current if not (top - 2 <= (w["top"] + w["bottom"]) / 2 <= bottom + 2)]
+            candidate = kept + mapped
+            try:
+                cand_table = next((t for t in tables_from_image_words(candidate, "x") if t.selected), None)
+            except Exception:
+                continue
+            if cand_table is None:
+                continue
+            cand_weak = len(weak_rows(cand_table))
+            if cand_weak < best_weak and len(cand_table.rows) >= len(table.rows):
+                best, best_weak = candidate, cand_weak
+        if best is not None:
+            current = best
+            fixed.append(number)
+    return current, fixed
+
+
 def table_stats(tables):
     """(узгоджених рядків, усього рядків) обраної таблиці: кількість, ціна й сума - числа, кількість × ціна = сума."""
     table = next((t for t in tables if t.selected), None)
@@ -247,12 +330,17 @@ def recognize_best(img, lang="uk", engine="auto", first_page=True):
         return words, info, note
     tables = tables_from_image_words(words, "x")
     quality = table_quality(tables)
-    if quality >= 1 or (quality == 0 and not first_page):
-        return words, info, note
-    words2, info2 = recognize_image(img, lang, engine, contrast=True)
-    words2, note2 = correct_ukrainian(words2)
-    if table_stats(tables_from_image_words(words2, "x")) > table_stats(tables):
-        return words2, info2, note2
+    if quality < 1 and not (quality == 0 and not first_page):
+        words2, info2 = recognize_image(img, lang, engine, contrast=True)
+        words2, note2 = correct_ukrainian(words2)
+        tables2 = tables_from_image_words(words2, "x")
+        if table_stats(tables2) > table_stats(tables):
+            words, info, note, tables = words2, info2, note2, tables2
+    words, redone = reocr_weak_rows(img, words, tables, lang, engine)
+    if redone:
+        words, note3 = correct_ukrainian(words)
+        extra = "Рядки " + ", ".join(map(str, redone)) + " розпізнано окремо (погано читалися разом з рамкою таблиці)."
+        note = (note + " " + extra) if note else extra
     return words, info, note
 
 
@@ -463,6 +551,7 @@ def _anchored_rows(lines, h, anchors, page_width):
     right_edge = max(a[1] for a in anchors) + tol
 
     rows, groups, labels = [], [a[0] for a in anchors], [a[3] if len(a) > 3 else "" for a in anchors]
+    spans = []
     for _t, cells, _w in lines[first:]:
         if _TOTAL_LINE.match(" ".join(c[2] for c in cells)):
             break
@@ -478,6 +567,7 @@ def _anchored_rows(lines, h, anchors, page_width):
         if len(values) < 2:
             if rows and texts and not values and all(t[1] < left_edge + tol for t in texts):
                 rows[-1][1] = f"{rows[-1][1]} {' '.join(t[2] for t in texts)}".strip()  # продовження назви
+                spans[-1] = (spans[-1][0], max(spans[-1][1], max(w["bottom"] for w in _w)))
                 continue
             if rows:
                 break
@@ -514,7 +604,8 @@ def _anchored_rows(lines, h, anchors, page_width):
                     qty, unit = first, f"{second} {unit}"
                     break
         rows.append([index, name, qty, unit, *prices, *sums])
-    return (rows, groups, labels) if rows else (None, None, None)
+        spans.append((min(w["top"] for w in _w), max(w["bottom"] for w in _w)))
+    return (rows, groups, labels, spans) if rows else (None, None, None, None)
 
 
 def _split_codes(header_cells, rows):
@@ -535,7 +626,7 @@ def _split_codes(header_cells, rows):
             digits = re.sub(r"[оОOl]", lambda x: "1" if x.group(0) == "l" else "0", m.group(2)).replace(" ", "")
             digits = digits[-common:] if len(digits) > common else digits  # зайва цифра від літери 'о' перед номером
             codes.append(f"{m.group(1).upper()}-{digits}")
-            r[1] = r[1][m.end():].strip()
+            r[1] = r[1][m.end():].lstrip('|.! ').strip()
         else:
             codes.append("")
     return codes
@@ -560,7 +651,7 @@ def form_table_from_words(words, name):
             expected, out_groups = tuple(order), list(order)
         else:
             expected, out_groups = tuple(g for g in ("qty", "price", "sum") if g in groups), ["qty", "price", "sum"]
-        rows, name_x, out_labels = [], None, None
+        rows, name_x, out_labels, out_spans = [], None, None, []
         for _t, row_cells in lines[h + 1:]:
             if _TOTAL_LINE.match(" ".join(c[2] for c in row_cells)):
                 break
@@ -578,20 +669,20 @@ def form_table_from_words(words, name):
             if rows:
                 break
         anchors = _header_anchors(lines3[h][2])
-        a_rows, a_groups, a_labels = (None, None, None)
+        a_rows, a_groups, a_labels, a_spans = (None, None, None, None)
         if len(anchors) >= 2:
-            a_rows, a_groups, a_labels = _anchored_rows(lines3, h, anchors, page_width)
+            a_rows, a_groups, a_labels, a_spans = _anchored_rows(lines3, h, anchors, page_width)
         if a_rows:  # за позиціями колонок шапки; береться, якщо дає не гірший результат, ніж розбір за вмістом
             name_cell = next((c[2] for c in cells if _fuzzy_any(c[2], _FORM_WORDS["name"])), "Найменування")
             header_a = ["№", fix_header_text(name_cell), "Кількість", "Од."] + _numeric_header(a_groups, a_labels)
             table_a = sources.Table(f"{name}, табл. 1 (за заголовком)", [header_a] + [(r + [""] * len(header_a))[:len(header_a)] for r in a_rows])
             if not rows:
-                rows, out_groups, out_labels = a_rows, a_groups, a_labels
+                rows, out_groups, out_labels, out_spans = a_rows, a_groups, a_labels, a_spans
             else:
                 header_l = ["№", fix_header_text(name_cell), "Кількість", "Од."] + _numeric_header(out_groups)
                 table_l = sources.Table("x", [header_l] + [(r + [""] * len(header_l))[:len(header_l)] for r in rows])
                 if (table_quality([table_a]) * len(a_rows), len(a_rows)) >= (table_quality([table_l]) * len(rows), len(rows)):
-                    rows, out_groups, out_labels = a_rows, a_groups, a_labels
+                    rows, out_groups, out_labels, out_spans = a_rows, a_groups, a_labels, a_spans
         if rows:
             name_cell = next((c[2] for c in cells if _fuzzy_any(c[2], _FORM_WORDS["name"])), "Найменування")
             name_cell = fix_header_text(name_cell)
@@ -600,6 +691,16 @@ def form_table_from_words(words, name):
             rows = [(r + [""] * width)[:width] for r in rows]
             for r in rows:
                 r[3] = fix_unit(r[3])
+                r[1] = re.sub(r"^[|.!\s]+", "", r[1])  # смуга рамки на початку назви
+            counts = {}
+            for r in rows:
+                if r[3]:
+                    counts[r[3]] = counts.get(r[3], 0) + 1
+            if counts:  # одиниця, яку OCR не прочитав, - та сама, що в більшості рядків (від 80 %)
+                common_unit, n_common = max(counts.items(), key=lambda kv: kv[1])
+                if n_common >= 0.8 * sum(1 for r in rows) and common_unit in _KNOWN_UNITS:
+                    for r in rows:
+                        r[3] = r[3] or common_unit
             units = {r[3] for r in rows if r[3]}
             for r in rows:  # одиниця '100 шт', злита з назвою
                 if not r[3]:
@@ -612,7 +713,7 @@ def form_table_from_words(words, name):
             if codes:
                 header = [header[0], "Код"] + header[1:]
                 rows = [[r[0], c] + r[1:] for r, c in zip(rows, codes)]
-            return sources.Table(f"{name}, табл. 1 (за заголовком)", [header] + rows)
+            return sources.Table(f"{name}, табл. 1 (за заголовком)", [header] + rows, spans=list(out_spans or []))
     return None
 
 

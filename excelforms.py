@@ -174,6 +174,13 @@ def detect_table(values, merges):
     def cell(r, c):
         return values[r][c] if 0 <= r < len(values) and c < len(values[r]) else None
 
+    # підзаголовки між шапкою й першим товаром ('Артикул' під 'Код УКТЗЕД', 'Ціна з ПДВ' під 'Ціна без ПДВ')
+    sub_headers = {}
+    for r in range(header_r + 1, items[0]):
+        for c, v in enumerate(values[r]):
+            if v is not None and str(v).strip() and not _is_numeric(v):
+                sub_headers[c] = " ".join(str(v).replace("*", " ").split())
+
     columns, head_row, head_merges = [], [], []  # columns: (колонка, з рядка продовження?)
     for c, text, c1 in header:
         anchors = sorted(
@@ -181,6 +188,9 @@ def detect_table(values, merges):
         ) or [c]
         if len(anchors) == 1 and any(cell(cont[r], anchors[0]) not in (None, "") for r in cont):
             first, second = _split_vat_header(text)
+            sub = next((sub_headers[cc] for cc in range(c, c1 + 1) if cc in sub_headers), None)
+            if sub:  # друга частина названа в підзаголовку шапки
+                second = sub
             columns += [(anchors[0], False), (anchors[0], True)]
             head_row += [first, second]
             continue

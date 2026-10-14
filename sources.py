@@ -134,8 +134,9 @@ def _line_cells(page):
     )
 
 
-def _line_cells_from_words(words):
-    """Те саме для списку слів {text, x0, x1, top, bottom} - від pdfplumber або від OCR."""
+def _line_cells_from_words(words, with_words=False):
+    """Те саме для списку слів {text, x0, x1, top, bottom} - від pdfplumber або від OCR.
+    with_words=True: третім елементом кожного рядка повертаються його слова."""
     words = [dict(w) for w in words if str(w.get("text", "")).strip()]
     if not words:
         return []
@@ -165,7 +166,7 @@ def _line_cells_from_words(words):
                 cells[-1][2] += " " + w["text"]
             else:
                 cells.append([w["x0"], w["x1"], w["text"]])
-        result.append((min(w["top"] for w in ln), cells))
+        result.append((min(w["top"] for w in ln), cells, ln) if with_words else (min(w["top"] for w in ln), cells))
     return result
 
 

@@ -26,14 +26,14 @@ _NUMBER = re.compile(r"^[+-]?\d[\d ]*(?:[.,]\d+)?$")
 _NUMBER_SIGN = re.compile(r"^(?:NQ|N°|Nº|№)$")
 _NUMBER_SIGN_BEFORE_DIGITS = re.compile(r"^(?:No|N2|N9|Nо)$")
 _FORM_WORDS = {
-    "name": ("найменування", "товари", "товар", "послуг", "послуги", "робіт", "назва", "опис"),
-    "qty": ("кількість", "кіл-сть"),
-    "price": ("ціна",),
-    "sum": ("сума", "вартість"),
+    "name": ("найменування", "товари", "товар", "послуг", "послуги", "робіт", "назва", "опис", "наименование", "товары"),
+    "qty": ("кількість", "кіл-сть", "количество", "кол-во"),
+    "price": ("ціна", "цена"),
+    "sum": ("сума", "вартість", "сумма", "стоимость"),
 }
 _TOTAL_LINE = re.compile(r"^\s*(разом|всього|усього|итого|всего|загальна\s+вартість|total)\b", re.IGNORECASE)
 _UNIT_CELL = re.compile(r"^(?:\d{1,4}\s*)?[^\d\s.,]{1,6}\.?$")
-_QTY_UNIT = re.compile(r"^(\d[\d\s.,]*?)\s+([^\d\s.,]\S{0,7})$")
+_QTY_UNIT = re.compile(r"^(\d[\d\s.,]*?)\s*([^\d\s.,]\S{0,7})$")
 
 
 def is_image(path):
@@ -104,6 +104,7 @@ def fix_words(words):
 
 
 _LOOKALIKE_LETTERS = {k: v for k, v in _LOOKALIKE.items() if not chr(k).isdigit()}
+_LOOKALIKE_LETTERS[ord("t")] = "т"
 
 
 _KNOWN_UNITS = ("шт", "кг", "г", "л", "мл", "м", "м2", "м3", "км", "см", "мм", "т", "год", "хв", "доба", "дн",
@@ -113,6 +114,10 @@ _KNOWN_UNITS = ("шт", "кг", "г", "л", "мл", "м", "м2", "м3", "км", 
 def fix_unit(unit):
     """Одиниця виміру після OCR: 'шT' -> 'шт', 'wт' -> 'шт', '1оо шт' -> '100 шт', 'род' -> 'год'."""
     unit = str(unit).strip().replace("w", "ш").replace("W", "Ш")
+    if unit.lower() in ("et", "ет", "ят", "ut", "uт", "ur", "ит"):
+        return "шт"
+    if unit.isupper() and 1 < len(unit) <= 5 and not any(ch.isdigit() for ch in unit):
+        unit = unit.lower()  # ШТ -> шт
     m = re.match(r"^(\d[\d\s]*\s)?([^\d\s.,]{2,8})\.?$", unit)
     if m and m.group(2).lower() not in _KNOWN_UNITS and len(m.group(2)) >= 3:
         close = difflib.get_close_matches(m.group(2).lower(), _KNOWN_UNITS, n=2, cutoff=0.66)
@@ -171,9 +176,9 @@ def recognize_image(img, lang="uk", engine="auto", contrast=False):
 
 
 def infer_missing_quantities(tables):
-    """Кількість, яку OCR не прочитав (дрібний текст поруч із рамкою), обчислюється як сума ÷ ціна, якщо вийшло
-    чисте число. Повертає примітку з номерами рядків або None."""
-    rows_done = []
+    """Кількість або сума, яку OCR не прочитав (дрібний текст поруч із рамкою), обчислюється з двох інших
+    (сума ÷ ціна, кількість × ціна), якщо вийшло чисте число. Повертає примітку з номерами рядків або None."""
+    qty_rows, sum_rows = [], []
     for table in tables:
         if "за заголовком" not in table.name or len(table.rows) < 2:
             continue
@@ -184,34 +189,36 @@ def infer_missing_quantities(tables):
         if None in (price_i, sum_i, qty_i):
             continue
         for number, row in enumerate(table.rows[1:], 1):
-            if str(row[qty_i]).strip():
-                continue
-            price, total = checks.to_decimal(row[price_i]), checks.to_decimal(row[sum_i])
-            if not price or total is None:
-                continue
-            qty = total / price
-            if abs(qty - qty.to_integral_value()) <= checks.Decimal("0.0005") and qty > 0:
-                row[qty_i] = str(int(qty.to_integral_value()))
-                rows_done.append(number)
-    if not rows_done:
-        return None
-    return "Кількість у рядках " + ", ".join(map(str, rows_done)) + " не розпізнано й обчислена як сума ÷ ціна — перевірте."
+            qty, price, total = (checks.to_decimal(row[i]) for i in (qty_i, price_i, sum_i))
+            if not str(row[qty_i]).strip() and price and total is not None:
+                value = total / price
+                if abs(value - value.to_integral_value()) <= checks.Decimal("0.0005") and value > 0:
+                    row[qty_i] = str(int(value.to_integral_value()))
+                    qty_rows.append(number)
+            elif not str(row[sum_i]).strip() and qty and price:
+                row[sum_i] = format((qty * price).quantize(checks.Decimal("0.01")), "f")
+                sum_rows.append(number)
+    parts = []
+    if qty_rows:
+        parts.append("Кількість у рядках " + ", ".join(map(str, qty_rows)) + " не розпізнано й обчислена як сума ÷ ціна")
+    if sum_rows:
+        parts.append("сума в рядках " + ", ".join(map(str, sum_rows)) + " не розпізнана й обчислена як кількість × ціна")
+    return ("; ".join(parts)[0].upper() + "; ".join(parts)[1:] + " — перевірте.") if parts else None
 
 
-def table_quality(tables):
-    """0..1: частка рядків обраної таблиці, де кількість, ціна й сума - числа і кількість × ціна = сума.
-    1 - таблицю знайдено й вона узгоджена; 0 - таблиці або товарів немає."""
+def table_stats(tables):
+    """(узгоджених рядків, усього рядків) обраної таблиці: кількість, ціна й сума - числа, кількість × ціна = сума."""
     table = next((t for t in tables if t.selected), None)
     if table is None:
-        return 0.0
+        return 0, 0
     prepared = converter.prepare_rows(table.rows, table.merges, flatten_newlines=True, trim_trailing_empty=True,
                                       sanitize_quotes=False, fill_merges=True, normalize_numbers=False)
     if len(prepared) < 2:
-        return 0.0
+        return 0, 0
     mapping = profiles.resolve_mapping(prepared[0], prepared[1:], "upr")
     items, _ = profiles.extract_items(prepared, mapping)
     if not items:
-        return 0.0
+        return 0, 0
     good = 0
     for item in items:
         qty = checks.to_decimal(profiles.split_quantity(item.get("Количество", ""))[0])
@@ -221,7 +228,13 @@ def table_quality(tables):
         diff = abs(qty * price - total)
         if diff <= checks.Decimal("0.02") or diff <= abs(total) * checks.Decimal("0.005"):
             good += 1
-    return good / len(items)
+    return good, len(items)
+
+
+def table_quality(tables):
+    """0..1: частка узгоджених рядків обраної таблиці; 1 - таблицю знайдено й вона узгоджена; 0 - таблиці немає."""
+    good, total = table_stats(tables)
+    return good / total if total else 0.0
 
 
 def recognize_best(img, lang="uk", engine="auto", first_page=True):
@@ -238,7 +251,7 @@ def recognize_best(img, lang="uk", engine="auto", first_page=True):
         return words, info, note
     words2, info2 = recognize_image(img, lang, engine, contrast=True)
     words2, note2 = correct_ukrainian(words2)
-    if table_quality(tables_from_image_words(words2, "x")) > quality:
+    if table_stats(tables_from_image_words(words2, "x")) > table_stats(tables):
         return words2, info2, note2
     return words, info, note
 
@@ -283,13 +296,17 @@ def _header_groups(texts):
     return order
 
 
-def _numeric_header(order):
-    """Назви колонок: одна ціна/сума - 'Ціна', 'Сума'; дві - 'без ПДВ' і 'з ПДВ'; більше - з номером."""
+def _numeric_header(order, labels=None):
+    """Назви колонок: одна ціна/сума - 'Ціна', 'Сума'; дві - 'без ПДВ' і 'з ПДВ' (порядок - за підписами шапки, якщо
+    відомі); більше - з номером."""
     names = []
     for group, base in (("price", "Ціна"), ("sum", "Сума")):
         count = order.count(group)
+        picked = [lab for g, lab in zip(order, labels or [""] * len(order)) if g == group]
         if count == 1:
             names.append(base)
+        elif count == 2 and picked == ["vat", "no_vat"]:
+            names += [f"{base} з ПДВ", f"{base} без ПДВ"]
         elif count == 2:
             names += [f"{base} без ПДВ", f"{base} з ПДВ"]
         else:
@@ -305,6 +322,8 @@ def _parse_form_row(cells, expected, next_index=None):
     glued = {}  # x0 числа -> '100 шт'
     for x0, _x1, text in cells:
         fixed = str(fix_numeric_cell(text)).strip()
+        if _PERCENT.match(fixed):
+            continue  # ставка ПДВ
         m = _QTY_UNIT.match(fixed)
         if m and _is_number(m.group(1)):
             items.append((x0, "num", m.group(1).strip()))
@@ -360,12 +379,176 @@ def _parse_form_row(cells, expected, next_index=None):
     return [index, name.strip(), values["qty"], unit, *prices, *sums]
 
 
+_PERCENT = re.compile(r"^\d{1,2}\s?%$")
+_CODE_PREFIX = re.compile(r"^([А-Яа-яІіЇїЄєA-Za-z]{2,3})\s?[-–]\s?([0-9оОOl]{3,}(?:\s\d{3,4})?)\s*(?=\S)")
+
+
+def _numeric_cells(cells):
+    """Числові комірки рядка: (індекс, центр числа, x0, x1, число, одиниця, злита з числом, або None)."""
+    out = []
+    for i, (x0, x1, text) in enumerate(cells):
+        fixed = str(fix_numeric_cell(text)).strip()
+        if _PERCENT.match(fixed):
+            continue  # ставка ПДВ
+        lead = re.match(r"^(\d[\d\s]*[.,]\d{2,3})\s+([^\d\s].*)$", fixed)
+        if lead and _is_number(lead.group(1)):  # '6346,00 реставрація ...': число злилося з текстом сусідньої колонки
+            share = len(lead.group(1)) / max(len(fixed), 1)
+            rest = lead.group(2).strip()
+            out.append((i, x0 + (x1 - x0) * share / 2, x0, x1, lead.group(1).strip(),
+                        rest if len(rest) <= 8 and not any(ch.isdigit() for ch in rest) else None))
+            continue
+        m = _QTY_UNIT.match(fixed)
+        if m and _is_number(m.group(1)):
+            share = len(m.group(1)) / max(len(fixed), 1)
+            out.append((i, x0 + (x1 - x0) * share / 2, x0, x1, m.group(1).strip(), m.group(2)))
+        elif _is_number(fixed):
+            out.append((i, (x0 + x1) / 2, x0, x1, fixed, None))
+    return out
+
+
+def _assign(numeric, anchors, tol):
+    """{індекс якоря: числова комірка}: найближчі пари 'комірка - якір' у межах допуску."""
+    pairs = sorted(
+        (abs(a[1] - n[1]), ai, ni)
+        for ni, n in enumerate(numeric) for ai, a in enumerate(anchors) if abs(a[1] - n[1]) <= tol
+    )
+    values, used = {}, set()
+    for _dist, ai, ni in pairs:
+        if ai not in values and ni not in used:
+            values[ai] = numeric[ni]
+            used.add(ni)
+    return values
+
+
+def _header_anchors(line_words):
+    anchors = []
+    for w in sorted(line_words, key=lambda w: w["x0"]):
+        token = re.sub(r"[^а-яіїєґa-z'-]", "", w["text"].lower())
+        if len(token) < 3:
+            continue
+        for group in ("qty", "price", "sum"):
+            if any(difflib.SequenceMatcher(None, token, k).ratio() >= 0.72 for k in _FORM_WORDS[group]):
+                anchors.append([group, (w["x0"] + w["x1"]) / 2, w["x1"]])
+                break
+    ordered = sorted(line_words, key=lambda w: w["x0"])
+    for anchor in anchors:  # слова після ключового слова до наступного ключового: 'без' / 'з' ПДВ
+        following = [w["text"].lower() for w in ordered if w["x0"] >= anchor[2] - 1][:2]
+        nxt = [a[1] for a in anchors if a[1] > anchor[1]]
+        following = [t for t, w in zip(following, [w for w in ordered if w["x0"] >= anchor[2] - 1][:2])
+                     if not nxt or (w["x0"] + w["x1"]) / 2 < nxt[0] - 5]
+        anchor.append("no_vat" if any(t.startswith("без") for t in following)
+                      else "vat" if any(re.fullmatch(r"(з|із|зі|с)", t) for t in following) else "")
+    return anchors
+
+
+def _anchored_rows(lines, h, anchors, page_width):
+    """Рядки таблиці за позиціями слів шапки: числа розкладаються по найближчих колонках (кількість, ціни, суми),
+    зайві колонки праворуч і ставки ПДВ відкидаються. Повертає (рядки, групи колонок) або (None, None)."""
+    tol = max(30.0, 0.07 * page_width)
+    first = h + 1
+    # уточнення якорів за даними: медіана центрів чисел, що потрапили в колонку
+    centers = {i: [] for i in range(len(anchors))}
+    for _t, cells, _w in lines[first:first + 80]:
+        if _TOTAL_LINE.match(" ".join(c[2] for c in cells)):
+            break
+        numeric = _numeric_cells(cells)
+        if len(numeric) < 2:
+            continue
+        for ai, n in _assign(numeric, anchors, tol).items():
+            centers[ai].append(n[1])
+    refined = [[a[0], sorted(centers[i])[len(centers[i]) // 2] if len(centers[i]) >= 2 else a[1], *a[2:]]
+               for i, a in enumerate(anchors)]
+    anchors = refined
+    left_edge = min(a[1] for a in anchors) - tol
+    right_edge = max(a[1] for a in anchors) + tol
+
+    rows, groups, labels = [], [a[0] for a in anchors], [a[3] if len(a) > 3 else "" for a in anchors]
+    for _t, cells, _w in lines[first:]:
+        if _TOTAL_LINE.match(" ".join(c[2] for c in cells)):
+            break
+        numeric = _numeric_cells(cells)
+        values = _assign(numeric, anchors, tol)
+        index, texts, consumed = "", [], {n[0] for n in values.values()}
+        for i, (x0, x1, text) in enumerate(cells):
+            if i in consumed or _PERCENT.match(text.strip()):
+                continue
+            if x0 > right_edge:
+                continue  # додаткові колонки праворуч (вхідний номер тощо)
+            texts.append((x0, x1, text.strip()))
+        if len(values) < 2:
+            if rows and texts and not values and all(t[1] < left_edge + tol for t in texts):
+                rows[-1][1] = f"{rows[-1][1]} {' '.join(t[2] for t in texts)}".strip()  # продовження назви
+                continue
+            if rows:
+                break
+            continue
+        if texts and re.fullmatch(r"\d{1,3}", texts[0][2]) and len(rows) + 1 == int(texts[0][2]):
+            index = texts.pop(0)[2]
+        elif texts:
+            m = re.match(rf"^{len(rows) + 1}\s+(\S.*)$", texts[0][2])
+            if m:
+                index = str(len(rows) + 1)
+                texts[0] = (texts[0][0], texts[0][1], m.group(1))
+        qty_ai = next((i for i, a in enumerate(anchors) if a[0] == "qty"), None)
+        unit = ""
+        if qty_ai in values and values[qty_ai][5]:
+            unit = values[qty_ai][5]
+        else:
+            for t in texts[1:]:
+                if len(t[2]) <= 8 and (not any(ch.isdigit() for ch in t[2]) or _UNIT_CELL.match(t[2])):
+                    unit = t[2]
+                    texts.remove(t)
+                    break
+        name = " ".join(t[2] for t in texts).strip()
+        if rows and not index and not name:
+            break  # рядок підсумків без підпису
+        qty = values[qty_ai][4] if qty_ai in values else ""
+        prices = [values[i][4] if i in values else "" for i, a in enumerate(anchors) if a[0] == "price"]
+        sums = [values[i][4] if i in values else "" for i, a in enumerate(anchors) if a[0] == "sum"]
+        if re.fullmatch(r"\d{1,3}\s\d{3}", qty) and unit:
+            # '160 100 шт': кількість 160 і упаковка '100 шт', а не 160100 (перевірка за ціною й сумою)
+            first, second = qty.split()
+            for p, sm in zip(prices, sums):
+                p, sm = checks.to_decimal(p), checks.to_decimal(sm)
+                if p and sm and abs(checks.Decimal(first) * p - sm) <= max(checks.Decimal("0.02"), abs(sm) * checks.Decimal("0.005"))                         and abs(checks.Decimal(first + second) * p - sm) > abs(sm) * checks.Decimal("0.005"):
+                    qty, unit = first, f"{second} {unit}"
+                    break
+        rows.append([index, name, qty, unit, *prices, *sums])
+    return (rows, groups, labels) if rows else (None, None, None)
+
+
+def _split_codes(header_cells, rows):
+    """Колонка 'Код' у шапці: код на початку назви ('НФ-00000256 Люк...') виноситься в окрему колонку."""
+    if not any(re.fullmatch(r"код\.?", c[2].strip().lower()) for c in header_cells):
+        return None
+    parts = []
+    for r in rows:
+        m = _CODE_PREFIX.match(r[1])
+        parts.append((m, r))
+    if sum(1 for m, _ in parts if m) < max(2, len(rows) * 0.6):
+        return None
+    codes = []
+    numbers = [re.sub(r"[оОOl]", lambda x: "1" if x.group(0) == "l" else "0", m.group(2)).replace(" ", "") for m, _ in parts if m]
+    common = max(set(map(len, numbers)), key=list(map(len, numbers)).count)
+    for m, r in parts:
+        if m:
+            digits = re.sub(r"[оОOl]", lambda x: "1" if x.group(0) == "l" else "0", m.group(2)).replace(" ", "")
+            digits = digits[-common:] if len(digits) > common else digits  # зайва цифра від літери 'о' перед номером
+            codes.append(f"{m.group(1).upper()}-{digits}")
+            r[1] = r[1][m.end():].strip()
+        else:
+            codes.append("")
+    return codes
+
+
 def form_table_from_words(words, name):
     """Таблиця друкованої форми (акт, рахунок) за заголовком і вмістом: знаходить рядок шапки за ключовими
     словами (з допуском на помилки OCR; достатньо 'Найменування' + 'Сума'), потім рядки з числами до
     рядка 'Разом'. Працює й для таблиці з одним рядком і для кількох колонок цін/сум (без ПДВ / з ПДВ);
     назва товару на кілька рядків склеюється. Назви колонок канонічні."""
-    lines = sources._line_cells_from_words(words)
+    lines3 = sources._line_cells_from_words(words, with_words=True)
+    lines = [(t, c) for t, c, _w in lines3]
+    page_width = max((w["x1"] for w in words), default=1000)
     for h, (_top, cells) in enumerate(lines):
         groups = {g for g, ws in _FORM_WORDS.items() if any(_fuzzy_any(c[2], ws) for c in cells)}
         numeric_groups = groups & {"qty", "price", "sum"}
@@ -377,7 +560,7 @@ def form_table_from_words(words, name):
             expected, out_groups = tuple(order), list(order)
         else:
             expected, out_groups = tuple(g for g in ("qty", "price", "sum") if g in groups), ["qty", "price", "sum"]
-        rows, name_x = [], None
+        rows, name_x, out_labels = [], None, None
         for _t, row_cells in lines[h + 1:]:
             if _TOTAL_LINE.match(" ".join(c[2] for c in row_cells)):
                 break
@@ -394,10 +577,25 @@ def form_table_from_words(words, name):
                 continue
             if rows:
                 break
+        anchors = _header_anchors(lines3[h][2])
+        a_rows, a_groups, a_labels = (None, None, None)
+        if len(anchors) >= 2:
+            a_rows, a_groups, a_labels = _anchored_rows(lines3, h, anchors, page_width)
+        if a_rows:  # за позиціями колонок шапки; береться, якщо дає не гірший результат, ніж розбір за вмістом
+            name_cell = next((c[2] for c in cells if _fuzzy_any(c[2], _FORM_WORDS["name"])), "Найменування")
+            header_a = ["№", fix_header_text(name_cell), "Кількість", "Од."] + _numeric_header(a_groups, a_labels)
+            table_a = sources.Table(f"{name}, табл. 1 (за заголовком)", [header_a] + [(r + [""] * len(header_a))[:len(header_a)] for r in a_rows])
+            if not rows:
+                rows, out_groups, out_labels = a_rows, a_groups, a_labels
+            else:
+                header_l = ["№", fix_header_text(name_cell), "Кількість", "Од."] + _numeric_header(out_groups)
+                table_l = sources.Table("x", [header_l] + [(r + [""] * len(header_l))[:len(header_l)] for r in rows])
+                if (table_quality([table_a]) * len(a_rows), len(a_rows)) >= (table_quality([table_l]) * len(rows), len(rows)):
+                    rows, out_groups, out_labels = a_rows, a_groups, a_labels
         if rows:
             name_cell = next((c[2] for c in cells if _fuzzy_any(c[2], _FORM_WORDS["name"])), "Найменування")
             name_cell = fix_header_text(name_cell)
-            header = ["№", name_cell, "Кількість", "Од."] + _numeric_header(out_groups)
+            header = ["№", name_cell, "Кількість", "Од."] + _numeric_header(out_groups, out_labels)
             width = len(header)
             rows = [(r + [""] * width)[:width] for r in rows]
             for r in rows:
@@ -410,6 +608,10 @@ def form_table_from_words(words, name):
                         if m:
                             r[3], r[1] = u, (r[1][: m.start()] + r[1][m.end():]).strip()
                             break
+            codes = _split_codes(cells, rows)
+            if codes:
+                header = [header[0], "Код"] + header[1:]
+                rows = [[r[0], c] + r[1:] for r, c in zip(rows, codes)]
             return sources.Table(f"{name}, табл. 1 (за заголовком)", [header] + rows)
     return None
 
@@ -496,11 +698,12 @@ def ocr_pdf(path, lang="uk", progress=None, engine="auto"):
     for number, (words, info) in enumerate(recognized, 1):
         words, fixed_note = correct_ukrainian(words)
         if resolve_engine(engine) == "rapid":  # сторінка без узгодженої таблиці - ще раз із вирівняним контрастом
-            quality = table_quality(tables_from_image_words(words, "x"))
+            page_tables = tables_from_image_words(words, "x")
+            quality = table_quality(page_tables)
             if quality < 1 and (quality > 0 or number == 1):
                 words2, info2 = recognize_image(images[number - 1], lang, engine, contrast=True)
                 words2, note2 = correct_ukrainian(words2)
-                if table_quality(tables_from_image_words(words2, "x")) > quality:
+                if table_stats(tables_from_image_words(words2, "x")) > table_stats(page_tables):
                     words, info, fixed_note = words2, info2, note2
         if fixed_note:
             fixed_notes.append(fixed_note)

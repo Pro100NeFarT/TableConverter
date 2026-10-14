@@ -27,7 +27,7 @@ row = scans._parse_form_row(
           (717, "1452.00"), (803, "1742.40")),
     expected, 4,
 )
-assert row[0] == "4" and row[2] == "60.000" and row[3] == "100шт" and row[7] == "1742.40", row
+assert row[0] == "4" and row[2] == "60.000" and row[3] == "100 шт" and row[7] == "1742.40", row
 
 # звичайна форма: кількість з одиницею в одній клітинці, одна ціна й сума
 row = scans._parse_form_row(cells((50, "1"), (90, "Послуга"), (300, "2 шт"), (360, "10,00"), (420, "20,00")),
@@ -39,3 +39,35 @@ assert scans.fix_unit("шT") == "шт" and scans.fix_unit("1оо шт") == "100 
 assert scans.fix_mixed_script("вiд 22.12.2022") == "від 22.12.2022"
 assert scans.fix_mixed_script("FD 3,5") == "FD 3,5"
 print("ВСІ ПЕРЕВІРКИ ФОРМ ЗІ СКАНІВ ПРОЙДЕНО")
+
+
+# ---- таблиця за позиціями слів шапки: Код, ставка ПДВ, 'N шт' в одній комірці, продовження назви, зайва колонка
+def line(y, *parts):
+    return [{"text": t, "x0": x, "x1": x + 9 * len(t), "top": y, "bottom": y + 14} for x, t in parts]
+
+
+words = []
+words += line(100, (10, "№"), (60, "Код"), (250, "Товар"), (520, "ПДВ"), (580, "Кількість"), (690, "Ціна"), (790, "Сума"), (900, "Вх."), (940, "№"))
+rows_data = [
+    ("1", "НФ-00000256", "Люк чорний", "20%", "100 шт", "370.00", "37 000,00", "12731"),
+    ("2", "НФ-00000257", "Люк зелений", "20%", "80шт", "415,00", "33 200,00", "13039"),
+    ("3", "НФ-00000408", "Люк коричневий", "20%", "20 ET", "415,00", "8 300,00", "11245"),
+]
+y = 140
+for n, code, title, vat, qty, price, total, extra in rows_data:
+    words += line(y, (10, n), (50, code), (160, title), (500, vat), (590, qty), (690, price), (780, total), (900, extra))
+    words += line(y + 18, (165, "(продовження назви)"))
+    y += 40
+words += line(y, (690, "6 855,00"), (780, "78 500,00"))
+words += line(y + 40, (10, "Всього на суму: сімдесят вісім тисяч"))
+table = scans.form_table_from_words(words, "тест")
+assert table is not None and table.rows[0][:2] == ["№", "Код"], table and table.rows[0]
+assert len(table.rows) == 4, table.rows
+header = table.rows[0]
+qty_i, price_i, sum_i, unit_i = header.index("Кількість"), header.index("Ціна"), header.index("Сума"), header.index("Од.")
+assert [r[qty_i] for r in table.rows[1:]] == ["100", "80", "20"], table.rows
+assert [r[unit_i] for r in table.rows[1:]] == ["шт", "шт", "шт"], table.rows
+assert table.rows[2][price_i] == "415,00" and table.rows[3][sum_i] == "8 300,00", table.rows
+assert table.rows[1][1] == "НФ-00000256" and table.rows[1][2] == "Люк чорний (продовження назви)", table.rows[1]
+assert all("12731" not in " ".join(r) and "20%" not in " ".join(r) for r in table.rows)
+print("ВСІ ПЕРЕВІРКИ ТАБЛИЦІ ЗА ПОЗИЦІЯМИ КОЛОНОК ПРОЙДЕНО")

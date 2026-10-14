@@ -48,13 +48,13 @@ def enhance(img):
     return ImageOps.autocontrast(img.convert("L"), cutoff=1).convert("RGB")
 
 
-def recognize(img, timeout=600):
+def recognize(img, timeout=600, contrast=False):
     """Слова зображення (PIL.Image): {'text','x0','x1','top','bottom'} у пікселях. Нахил виправляє сам виконавець.
     Повертає (слова, {'lang': 'uk', 'engine': ..., 'angle': ...})."""
     token = uuid.uuid4().hex
     src, out = (os.path.join(tempfile.gettempdir(), f"tc_rapid_{token}{ext}") for ext in (".png", ".json"))
     try:
-        enhance(img).save(src)
+        (enhance(img) if contrast else img.convert("RGB")).save(src)
         proc = subprocess.run(
             worker_command() + [src, out],
             capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW,
@@ -80,14 +80,14 @@ def _to_words(data):
     return words, {"lang": "uk", "engine": data.get("engine", "rapidocr"), "angle": data.get("angle")}
 
 
-def recognize_many(images, timeout=1800):
+def recognize_many(images, timeout=1800, contrast=False):
     """Кілька зображень (PIL.Image) одним запуском виконавця: [(слова, інфо), ...] у тому ж порядку."""
     token = uuid.uuid4().hex
     out = os.path.join(tempfile.gettempdir(), f"tc_rapid_{token}.json")
     sources = [os.path.join(tempfile.gettempdir(), f"tc_rapid_{token}_{i}.png") for i in range(len(images))]
     try:
         for img, path in zip(images, sources):
-            enhance(img).save(path)
+            (enhance(img) if contrast else img.convert("RGB")).save(path)
         proc = subprocess.run(
             worker_command() + ["--batch", out] + sources,
             capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW,

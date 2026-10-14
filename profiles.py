@@ -159,7 +159,7 @@ def detect_mapping(headers, data_rows, fields):
     return result
 
 
-_PRICE_RE = r"ц[іi]на|цена|price"
+_PRICE_RE = r"ц[іi]на|цена|price|закуп|[іi]рц|ррц|роздр|прайс"
 _SUM_RE = r"^сума|^сумма|^вс[іе]го|^всього|вартість|стоимость|amount|^total"
 
 
@@ -175,6 +175,15 @@ def _decimal(value):
         return None
 
 
+def _best_filled(prices, data_rows, low):
+    """Прайс-лист із кількома цінами: колонка в гривнях, що заповнена в найбільшої кількості рядків."""
+    def filled(i):
+        return sum(1 for r in data_rows if i < len(r) and str(r[i]).strip())
+
+    uah = [i for i in prices if "грн" in low[i]] or prices
+    return max(uah, key=lambda i: (filled(i), -i))
+
+
 def _pick_price_sum(low, used, data_rows, qty_idx):
     """Ціна й сума, що узгоджуються з кількістю (кількість × ціна = сума). У формах зі знижкою є
     кілька пар (ціна/сума до і після знижки) - вибирається остання (права) з узгоджених, без ПДВ."""
@@ -187,9 +196,9 @@ def _pick_price_sum(low, used, data_rows, qty_idx):
     prices = [i for i in prices if not _is_vat(low[i])] or prices
     sums = [i for i in sums if not _is_vat(low[i])] or sums
     if not prices or not sums:
-        return (prices[0] if prices else None), (sums[0] if sums else None)
+        return (_best_filled(prices, data_rows, low) if prices else None), (sums[0] if sums else None)
     if qty_idx is None:
-        return prices[0], sums[0]
+        return _best_filled(prices, data_rows, low), sums[0]
 
     def cell(row, i):
         return _decimal(row[i]) if i < len(row) and str(row[i]).strip() else None

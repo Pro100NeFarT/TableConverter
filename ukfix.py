@@ -71,6 +71,9 @@ def fix_word(word):
             return fixed
         if good:
             return word  # кілька варіантів - не вгадуємо
+    # OCR часто губить першу велику «І» ('нформаційні' -> 'Інформаційні')
+    if len(word) >= 6 and word[0].islower() and is_known("і" + low):
+        return "І" + word
     return word
 
 

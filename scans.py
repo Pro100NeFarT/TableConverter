@@ -7,8 +7,11 @@ import difflib
 import os
 import re
 
+import checks
+import converter
 import ocr_rapid
 import ocr_windows
+import profiles
 import sources
 import ukfix
 
@@ -103,9 +106,18 @@ def fix_words(words):
 _LOOKALIKE_LETTERS = {k: v for k, v in _LOOKALIKE.items() if not chr(k).isdigit()}
 
 
+_KNOWN_UNITS = ("шт", "кг", "г", "л", "мл", "м", "м2", "м3", "км", "см", "мм", "т", "год", "хв", "доба", "дн",
+                "міс", "уп", "упак", "пач", "компл", "набір", "пар", "рул", "бут", "кор", "пак", "послуга", "послуг")
+
+
 def fix_unit(unit):
-    """Одиниця виміру після OCR: 'шT' -> 'шт', '1оо шт' -> '100 шт'."""
-    unit = str(unit).strip()
+    """Одиниця виміру після OCR: 'шT' -> 'шт', 'wт' -> 'шт', '1оо шт' -> '100 шт', 'род' -> 'год'."""
+    unit = str(unit).strip().replace("w", "ш").replace("W", "Ш")
+    m = re.match(r"^(\d[\d\s]*\s)?([^\d\s.,]{2,8})\.?$", unit)
+    if m and m.group(2).lower() not in _KNOWN_UNITS and len(m.group(2)) >= 3:
+        close = difflib.get_close_matches(m.group(2).lower(), _KNOWN_UNITS, n=2, cutoff=0.66)
+        if len(close) == 1:  # лише коли найближча одиниця одна
+            return f"{m.group(1) or ''}{close[0]}"
     if re.search(r"[A-Za-z]", unit):
         unit = unit.translate(_LOOKALIKE_LETTERS).lower()
     m = re.match(r"^([\dОоOo]{1,5})\s*([^\d\s.,]{1,6}\.?)$", unit)
@@ -137,13 +149,13 @@ def resolve_engine(engine="auto"):
     return engine
 
 
-def recognize_image(img, lang="uk", engine="auto"):
+def recognize_image(img, lang="uk", engine="auto", contrast=False):
     """Слова зображення з виправленням нахилу. Повертає (слова, інфо); інфо['engine'] - 'rapid' або 'windows'.
     Windows OCR: якщо бачить кут тексту, зображення вирівнюється й розпізнається вдруге; RapidOCR вирівнює сам."""
     from PIL import Image
 
     if resolve_engine(engine) == "rapid":
-        words, info = ocr_rapid.recognize(img)
+        words, info = ocr_rapid.recognize(img, contrast=contrast)
         info["engine_kind"] = "rapid"
         return words, info
     words, info = ocr_windows.recognize(img, lang)
@@ -156,6 +168,79 @@ def recognize_image(img, lang="uk", engine="auto"):
             words, info = words2, info2
     info["engine_kind"] = "windows"
     return fix_words(words), info
+
+
+def infer_missing_quantities(tables):
+    """Кількість, яку OCR не прочитав (дрібний текст поруч із рамкою), обчислюється як сума ÷ ціна, якщо вийшло
+    чисте число. Повертає примітку з номерами рядків або None."""
+    rows_done = []
+    for table in tables:
+        if "за заголовком" not in table.name or len(table.rows) < 2:
+            continue
+        header = [str(h) for h in table.rows[0]]
+        price_i = next((i for i, h in enumerate(header) if h.startswith("Ціна")), None)
+        sum_i = next((i for i, h in enumerate(header) if h.startswith("Сума")), None)
+        qty_i = next((i for i, h in enumerate(header) if h.startswith("Кількість")), None)
+        if None in (price_i, sum_i, qty_i):
+            continue
+        for number, row in enumerate(table.rows[1:], 1):
+            if str(row[qty_i]).strip():
+                continue
+            price, total = checks.to_decimal(row[price_i]), checks.to_decimal(row[sum_i])
+            if not price or total is None:
+                continue
+            qty = total / price
+            if abs(qty - qty.to_integral_value()) <= checks.Decimal("0.0005") and qty > 0:
+                row[qty_i] = str(int(qty.to_integral_value()))
+                rows_done.append(number)
+    if not rows_done:
+        return None
+    return "Кількість у рядках " + ", ".join(map(str, rows_done)) + " не розпізнано й обчислена як сума ÷ ціна — перевірте."
+
+
+def table_quality(tables):
+    """0..1: частка рядків обраної таблиці, де кількість, ціна й сума - числа і кількість × ціна = сума.
+    1 - таблицю знайдено й вона узгоджена; 0 - таблиці або товарів немає."""
+    table = next((t for t in tables if t.selected), None)
+    if table is None:
+        return 0.0
+    prepared = converter.prepare_rows(table.rows, table.merges, flatten_newlines=True, trim_trailing_empty=True,
+                                      sanitize_quotes=False, fill_merges=True, normalize_numbers=False)
+    if len(prepared) < 2:
+        return 0.0
+    mapping = profiles.resolve_mapping(prepared[0], prepared[1:], "upr")
+    items, _ = profiles.extract_items(prepared, mapping)
+    if not items:
+        return 0.0
+    good = 0
+    for item in items:
+        qty = checks.to_decimal(profiles.split_quantity(item.get("Количество", ""))[0])
+        price, total = checks.to_decimal(item.get("Цена")), checks.to_decimal(item.get("Сумма"))
+        if qty is None or price is None or total is None:
+            continue
+        diff = abs(qty * price - total)
+        if diff <= checks.Decimal("0.02") or diff <= abs(total) * checks.Decimal("0.005"):
+            good += 1
+    return good / len(items)
+
+
+def recognize_best(img, lang="uk", engine="auto", first_page=True):
+    """Слова зображення; коли таблиця не знайдена або її числа не узгоджуються (кількість × ціна ≠ сума),
+    зображення розпізнається ще раз із вирівняним контрастом і береться кращий результат.
+    Повертає (слова, інфо, примітка про виправлення за словником або None)."""
+    words, info = recognize_image(img, lang, engine)
+    words, note = correct_ukrainian(words)
+    if resolve_engine(engine) != "rapid":
+        return words, info, note
+    tables = tables_from_image_words(words, "x")
+    quality = table_quality(tables)
+    if quality >= 1 or (quality == 0 and not first_page):
+        return words, info, note
+    words2, info2 = recognize_image(img, lang, engine, contrast=True)
+    words2, note2 = correct_ukrainian(words2)
+    if table_quality(tables_from_image_words(words2, "x")) > quality:
+        return words2, info2, note2
+    return words, info, note
 
 
 def lines_from_words(words):
@@ -172,6 +257,7 @@ def lines_from_words(words):
         if sum(numeric) >= 4:
             seen_table = True
         line = fix_mixed_script("\t".join(c[2] for c in cells))
+        line = re.sub(r"\b[вВ][ИиIі]д\b(?=\s+\d{1,2}[./]\d{1,2}[./]\d{2,4})", "від", line)
         lines.append(re.sub(r"(№\s*)([А-ЯІЇЄA-Z][а-яіїєa-z]{1,3})(?=[-/]?\d)", lambda m: m.group(1) + m.group(2).upper(), line))
     return lines
 
@@ -248,7 +334,7 @@ def _parse_form_row(cells, expected, next_index=None):
             unit = glued[extra[0][0]]
             items = [i for i in items if not (i[0] == extra[0][0] + 1 and i[1] == "text")]
         targets = list(expected)
-    elif len(numbers) == need:
+    elif len(numbers) == need and "sum" in expected:  # без 'Сума' у шапці (OCR) розподіл за кількістю чисел
         targets = list(expected)
     else:
         count = min(len(numbers), 3)
@@ -282,7 +368,9 @@ def form_table_from_words(words, name):
     lines = sources._line_cells_from_words(words)
     for h, (_top, cells) in enumerate(lines):
         groups = {g for g, ws in _FORM_WORDS.items() if any(_fuzzy_any(c[2], ws) for c in cells)}
-        if len(cells) < 2 or "name" not in groups or not groups & {"qty", "price", "sum"}:
+        numeric_groups = groups & {"qty", "price", "sum"}
+        # назва товару в шапці може не розпізнатися - тоді достатньо двох із трьох: кількість, ціна, сума
+        if len(cells) < 2 or not numeric_groups or ("name" not in groups and len(numeric_groups) < 2):
             continue
         order = _header_groups([c[2] for c in cells])
         if len(order) >= 4 and order.count("qty") == 1:  # кілька колонок цін/сум (без ПДВ / з ПДВ)
@@ -373,10 +461,10 @@ def ocr_image(path, lang="uk", engine="auto"):
 
     with Image.open(path) as img:
         img = ImageOps.exif_transpose(img).convert("RGB")
-        words, info = recognize_image(img, lang, engine)
-    words, fixed_note = correct_ukrainian(words)
+        words, info, fixed_note = recognize_best(img, lang, engine)
     tables = tables_from_image_words(words, "Фото/скан")
-    return tables, lines_from_words(words), notes_for(info) + ([fixed_note] if fixed_note else [])
+    inferred = infer_missing_quantities(tables)
+    return tables, lines_from_words(words), notes_for(info) + [n for n in (fixed_note, inferred) if n]
 
 
 def has_text_layer(path):
@@ -407,9 +495,20 @@ def ocr_pdf(path, lang="uk", progress=None, engine="auto"):
     fixed_notes = []
     for number, (words, info) in enumerate(recognized, 1):
         words, fixed_note = correct_ukrainian(words)
+        if resolve_engine(engine) == "rapid":  # сторінка без узгодженої таблиці - ще раз із вирівняним контрастом
+            quality = table_quality(tables_from_image_words(words, "x"))
+            if quality < 1 and (quality > 0 or number == 1):
+                words2, info2 = recognize_image(images[number - 1], lang, engine, contrast=True)
+                words2, note2 = correct_ukrainian(words2)
+                if table_quality(tables_from_image_words(words2, "x")) > quality:
+                    words, info, fixed_note = words2, info2, note2
         if fixed_note:
             fixed_notes.append(fixed_note)
-        tables += tables_from_image_words(words, f"Стор. {number}")
+        page_tables = tables_from_image_words(words, f"Стор. {number}")
+        inferred = infer_missing_quantities(page_tables)
+        if inferred:
+            fixed_notes.append(inferred)
+        tables += page_tables
         if number <= 2:
             lines += lines_from_words(words)
-    return tables, lines, notes_for(info) + fixed_notes[:1]
+    return tables, lines, notes_for(info) + fixed_notes[:2]

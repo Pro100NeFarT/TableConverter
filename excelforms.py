@@ -65,7 +65,10 @@ def _read_xlsx(path):
 def _read_xls(path):
     import xlrd
 
-    book = xlrd.open_workbook(path, formatting_info=True)
+    try:
+        book = xlrd.open_workbook(path, formatting_info=True)
+    except xlrd.compdoc.CompDocError:  # файл, збережений сторонньою програмою, зі «зламаною» структурою контейнера
+        book = xlrd.open_workbook(path, formatting_info=True, ignore_workbook_corruption=True)
     grids = []
     for sheet in book.sheets():
         values = []

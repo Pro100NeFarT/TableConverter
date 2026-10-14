@@ -42,14 +42,17 @@ def run_checks(prepared, mapping, info=None):
     results = []
     items, totals = profiles.extract_items(prepared, mapping)
 
+    price_list = bool(mapping.get("Цена")) and not mapping.get("Количество") and not mapping.get("Сумма")
     for field, label in (("Наименование", "назва"), ("Количество", "кількість"), ("Сумма", "сума")):
+        if price_list and field != "Наименование":
+            continue  # прайс-лист: кількості й суми в ньому немає
         if not mapping.get(field):
             results.append(("error", f"Не знайдено колонку «{label}» - перевірте підбір колонок."))
     if not items:
         results.append(("error", "У таблиці немає рядків з товарами."))
         return results
 
-    results.append(("ok", f"Позицій у таблиці: {len(items)}."))
+    results.append(("ok", f"Позицій у таблиці: {len(items)}." + (" Схоже на прайс-лист (кількості й суми немає)." if price_list else "")))
 
     declared = info.get("Кількість найменувань")
     if declared and declared.strip().isdigit():
@@ -58,7 +61,7 @@ def run_checks(prepared, mapping, info=None):
         else:
             results.append(("error", f"Позицій {len(items)}, а в документі «Всього найменувань» {declared}."))
 
-    bad_numbers, bad_rows, zero_price, empty_names = [], [], [], []
+    bad_numbers, bad_rows, zero_price, empty_names, no_qty = [], [], [], [], []
     total_sum = Decimal(0)
     have_sum = False
     for n, item in enumerate(items, 1):
@@ -72,6 +75,8 @@ def run_checks(prepared, mapping, info=None):
                 bad_numbers.append(f"{n} ({label}: «{raw}»)")
         if not str(item.get("Наименование", "")).strip():
             empty_names.append(n)
+        if mapping.get("Количество") and not str(item.get("Количество", "")).strip() and (price is not None or total is not None):
+            no_qty.append(n)
         if total is not None:
             total_sum += total
             have_sum = True
@@ -86,6 +91,8 @@ def run_checks(prepared, mapping, info=None):
         results.append(("error", "Не розпізнано число: рядок " + _rows_list(bad_numbers) + "."))
     if empty_names:
         results.append(("error", "Порожня назва товару: рядок " + _rows_list(empty_names) + "."))
+    if no_qty:
+        results.append(("error", "Не вказано кількість: рядок " + _rows_list(no_qty) + "."))
     if bad_rows:
         results.append(("warn", "Кількість × ціна ≠ сума: рядок " + _rows_list(bad_rows) + "."))
     elif have_sum and not bad_numbers:

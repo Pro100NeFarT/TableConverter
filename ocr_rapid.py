@@ -41,13 +41,20 @@ def installed_version():
         return ""
 
 
+def enhance(img):
+    """Автоконтраст у відтінках сірого: вирівнює освітлення фото, на чистих сканах нічого не змінює."""
+    from PIL import ImageOps
+
+    return ImageOps.autocontrast(img.convert("L"), cutoff=1).convert("RGB")
+
+
 def recognize(img, timeout=600):
     """Слова зображення (PIL.Image): {'text','x0','x1','top','bottom'} у пікселях. Нахил виправляє сам виконавець.
     Повертає (слова, {'lang': 'uk', 'engine': ..., 'angle': ...})."""
     token = uuid.uuid4().hex
     src, out = (os.path.join(tempfile.gettempdir(), f"tc_rapid_{token}{ext}") for ext in (".png", ".json"))
     try:
-        img.convert("RGB").save(src)
+        enhance(img).save(src)
         proc = subprocess.run(
             worker_command() + [src, out],
             capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW,
@@ -80,7 +87,7 @@ def recognize_many(images, timeout=1800):
     sources = [os.path.join(tempfile.gettempdir(), f"tc_rapid_{token}_{i}.png") for i in range(len(images))]
     try:
         for img, path in zip(images, sources):
-            img.convert("RGB").save(path)
+            enhance(img).save(path)
         proc = subprocess.run(
             worker_command() + ["--batch", out] + sources,
             capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW,

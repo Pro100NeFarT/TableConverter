@@ -2,4 +2,6 @@ openpyxl
 xlrd
 pdfplumber
 pillow
+pymorphy3
+pymorphy3-dicts-uk
 pyinstaller

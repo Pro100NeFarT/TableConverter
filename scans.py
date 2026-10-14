@@ -10,6 +10,7 @@ import re
 import ocr_rapid
 import ocr_windows
 import sources
+import ukfix
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
 DPI = 200
@@ -347,6 +348,15 @@ def tables_from_image_words(words, name):
     return tables
 
 
+def correct_ukrainian(words):
+    """Слова з виправленими за словником українськими літерами; (слова, примітка або None)."""
+    words, changes = ukfix.fix_words(words)
+    if not changes:
+        return words, None
+    sample = ", ".join(f"{a} → {b}" for a, b in list(dict.fromkeys(changes))[:3])
+    return words, f"За словником виправлено українські літери: {len(changes)} ({sample})."
+
+
 def notes_for(info):
     notes = ["Текст розпізнано автоматично (OCR): обов'язково перевірте вкладку «Контроль» і прев'ю."]
     if info.get("engine_kind") == "windows":
@@ -364,8 +374,9 @@ def ocr_image(path, lang="uk", engine="auto"):
     with Image.open(path) as img:
         img = ImageOps.exif_transpose(img).convert("RGB")
         words, info = recognize_image(img, lang, engine)
+    words, fixed_note = correct_ukrainian(words)
     tables = tables_from_image_words(words, "Фото/скан")
-    return tables, lines_from_words(words), notes_for(info)
+    return tables, lines_from_words(words), notes_for(info) + ([fixed_note] if fixed_note else [])
 
 
 def has_text_layer(path):
@@ -393,8 +404,12 @@ def ocr_pdf(path, lang="uk", progress=None, engine="auto"):
         recognized = [(w, dict(i, engine_kind="rapid")) for w, i in ocr_rapid.recognize_many(images)]
     else:
         recognized = [recognize_image(img, lang, engine) for img in images]
+    fixed_notes = []
     for number, (words, info) in enumerate(recognized, 1):
+        words, fixed_note = correct_ukrainian(words)
+        if fixed_note:
+            fixed_notes.append(fixed_note)
         tables += tables_from_image_words(words, f"Стор. {number}")
         if number <= 2:
             lines += lines_from_words(words)
-    return tables, lines, notes_for(info)
+    return tables, lines, notes_for(info) + fixed_notes[:1]
